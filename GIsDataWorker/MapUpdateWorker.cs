@@ -44,7 +44,7 @@ public class MapUpdateWorker : BackgroundService
                     await ApplyDiffUpdate();
                 else
                     await RunFullImport();
-                }
+               
             }
             catch (Exception ex)
             {
