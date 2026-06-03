@@ -7,10 +7,9 @@ public class MapUpdateWorker : BackgroundService
 {
     private readonly ILogger<MapUpdateWorker> _logger;
     private readonly IConfiguration _config;
-    private readonly IConfigurationSection _mapSettings;  // FIX 1: was accessed as _settings everywhere
-    private string _osm2pgsqlPath = string.Empty;
-
-    // Convenience accessor so every call site doesn't need to change
+    private readonly IConfigurationSection _mapSettings;
+    private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
+     private string _osm2pgsqlPath = string.Empty;
     private IConfigurationSection _settings => _mapSettings;
 
     public MapUpdateWorker(ILogger<MapUpdateWorker> logger, IConfiguration config)
@@ -20,47 +19,38 @@ public class MapUpdateWorker : BackgroundService
         _mapSettings = _config.GetSection("MapSettings");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Main loop
-    // ─────────────────────────────────────────────────────────────────────────
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Initialize osm2pgsql at startup
         try
         {
-            string osm2pgsqlFolder = _settings["Osm2PgsqlFolder"] ?? Path.Combine(AppContext.BaseDirectory, "tools");
+            string osm2pgsqlFolder = _mapSettings["Osm2PgsqlFolder"] ?? Path.Combine(AppContext.BaseDirectory, "tools");
             await EnsureOsm2PgSqlExists(osm2pgsqlFolder);
-            _logger.LogInformation("osm2pgsql is ready at: {Path}", _osm2pgsqlPath);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to initialize osm2pgsql. The worker will not function properly.");
-            throw;
+            _logger.LogError(ex, "Initialization failed. Worker will stop.");
+            return;
         }
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            await _lock.WaitAsync(stoppingToken);
             try
             {
-                bool dbExists = await IsDatabaseExists();
-
-                if (dbExists)
-                {
-                    _logger.LogInformation("Database found. Checking for updates...");
+                if (await IsDatabaseExists())
                     await ApplyDiffUpdate();
-                }
                 else
-                {
-                    _logger.LogInformation("Database not found. Starting full import...");
                     await RunFullImport();
-                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in processing loop.");
             }
-
-            await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
+            finally
+            {
+                _lock.Release();
+            }
+            await Task.Delay(TimeSpan.FromDays(30), stoppingToken);
         }
     }
 
@@ -232,7 +222,7 @@ public class MapUpdateWorker : BackgroundService
     // ─────────────────────────────────────────────────────────────────────────
     private string ResolveStyleArg()
     {
-        string configuredStyle = _settings["Osm2PgsqlStyleFile"] ?? "";
+        string configuredStyle = _settings["Osm2PgsqlStyleFile"]!;
 
         // ── 1 & 2: explicitly configured path ────────────────────────────────
         if (!string.IsNullOrEmpty(configuredStyle))

@@ -2,6 +2,7 @@ using GIsDataWorker;
 using GIsDataWorker.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting.WindowsServices;
+using System.Runtime.InteropServices;
 
 // ── Fix content root so appsettings.json is found from the .exe folder,
 //    not System32 (which is the default working directory for Windows Services)
@@ -31,12 +32,7 @@ builder.Services.AddWindowsService(o =>
     o.ServiceName = builder.Configuration["WindowsService:ServiceName"] !;
 });
 
-builder.Logging.AddEventLog(settings =>
-{
-    settings.SourceName = builder.Configuration["Logging:EventLog:SourceName"] !;
-    settings.LogName = builder.Configuration["Logging:EventLog:LogName"] !;
-});
-
+ 
 // ── Database
 builder.Services.AddDbContext<ApplicationDbContext>(dbOptions =>
     dbOptions.UseNpgsql(
