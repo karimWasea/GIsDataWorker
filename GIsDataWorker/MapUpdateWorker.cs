@@ -2,49 +2,69 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using GIsDataWorker.Models;
+using Microsoft.EntityFrameworkCore;
 
 public class MapUpdateWorker : BackgroundService
 {
     private readonly ILogger<MapUpdateWorker> _logger;
     private readonly IConfiguration _config;
     private readonly IConfigurationSection _mapSettings;
-    private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
-     private string _osm2pgsqlPath = string.Empty;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly SemaphoreSlim _importLock = new(1, 1);
+    private string _osm2pgsqlPath = string.Empty;
+
     private IConfigurationSection _settings => _mapSettings;
- 
-    public MapUpdateWorker(ILogger<MapUpdateWorker> logger, IConfiguration config)
+
+    public MapUpdateWorker(
+        ILogger<MapUpdateWorker> logger,
+        IConfiguration config,
+        IServiceScopeFactory scopeFactory)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _config = config;
         _mapSettings = _config.GetSection("MapSettings");
+        _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Main loop
-    // ─────────────────────────────────────────────────────────────────────────
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
-            string osm2pgsqlFolder = _mapSettings["Osm2PgsqlFolder"] ?? Path.Combine(AppContext.BaseDirectory, "tools");
+            string osm2pgsqlFolder = _settings["Osm2PgsqlFolder"] ?? Path.Combine(AppContext.BaseDirectory, "tools");
             await EnsureOsm2PgSqlExists(osm2pgsqlFolder);
+            _logger.LogInformation("osm2pgsql is ready at: {Path}", _osm2pgsqlPath);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Initialization failed. Worker will stop.");
-            return;
+            _logger.LogError(ex, "Failed to initialize osm2pgsql. The worker will not function properly.");
+            throw;
         }
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            await _lock.WaitAsync(stoppingToken);
+            await _importLock.WaitAsync(stoppingToken);
             try
             {
-                if (await IsDatabaseExists())
-                    await ApplyDiffUpdate();
+                if (await IsDatabaseReady())
+                {
+                    bool isInitialized = await IsOsm2PgSqlInitialized();
+
+                    if (!isInitialized)
+                    {
+                        _logger.LogInformation("Database not initialized. Starting full import...");
+                        await RunFullImport();
+                    }
+                    else
+                    {
+                        _logger.LogInformation("Database already initialized. Checking for updates...");
+                        await ApplyDiffUpdate();
+                    }
+                }
                 else
-                    await RunFullImport();
-               
+                {
+                    _logger.LogError("Database is not ready. Will retry in 15 minutes.");
+                }
             }
             catch (Exception ex)
             {
@@ -52,26 +72,47 @@ public class MapUpdateWorker : BackgroundService
             }
             finally
             {
-                _lock.Release();
+                _importLock.Release();
+            }
+
+            await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
         }
-            await Task.Delay(TimeSpan.FromDays(30), stoppingToken);
-    }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Full import
-    // ─────────────────────────────────────────────────────────────────────────
+    private async Task<bool> IsDatabaseReady()
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            return await db.Database.CanConnectAsync();
+        }
+        catch { return false; }
+    }
+
+    private async Task<bool> IsOsm2PgSqlInitialized()
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+            var result = await db.Database.SqlQueryRaw<int>(
+                "SELECT COUNT(*) FROM information_schema.tables " +
+                "WHERE table_name = 'planet_osm_point' AND table_schema = 'public'"
+            ).ToListAsync();
+
+            return result.FirstOrDefault() > 0;
+        }
+        catch { return false; }
+    }
+
     private async Task RunFullImport()
     {
         string baseUrl = _settings["BaseUrl"]!;
         string downloadUrl = await GetLatestUrl(baseUrl, @"href=""([^""]+latest\.osm\.pbf)""");
         if (string.IsNullOrEmpty(downloadUrl))
             throw new Exception("Could not find full map URL.");
-
-        string pgRoot = _settings["PostgreSqlRootPath"]!;
-        string binPath = FindPostgresBinPath(pgRoot)
-            ?? throw new Exception($"Could not find PostgreSQL bin folder under: {pgRoot}");
-        await SetupDatabase(binPath);
 
         string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".pbf");
         try
@@ -82,8 +123,9 @@ public class MapUpdateWorker : BackgroundService
             if (!fileInfo.Exists || fileInfo.Length == 0)
                 throw new Exception($"Download produced an empty or missing file at: {tempPath}");
 
-            await ExecuteOsm2PgSql(tempPath, "--slim -s");
-             _logger.LogInformation("Full import completed successfully.");
+            _logger.LogInformation("Starting full osm2pgsql import with --create mode...");
+            await ExecuteOsm2PgSql(tempPath, "--create --slim --cache 1000");
+            _logger.LogInformation("Full import completed successfully.");
         }
         finally
         {
@@ -91,27 +133,23 @@ public class MapUpdateWorker : BackgroundService
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Diff update
-    // ─────────────────────────────────────────────────────────────────────────
     private async Task ApplyDiffUpdate()
     {
         string updatesUrl = _settings["UpdatesUrl"]!;
         string diffUrl = await GetLatestUrl(updatesUrl, @"href=""([^""]+osc\.gz)""");
         if (string.IsNullOrEmpty(diffUrl))
         {
-            _logger.LogInformation("There are no updates");
+            _logger.LogInformation("No updates available at this time.");
             return;
         }
-
-
 
         string tempDiffPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".osc.gz");
         try
         {
             await DownloadFile(diffUrl, tempDiffPath);
-            await ExecuteOsm2PgSql(tempDiffPath, "--append");
-             _logger.LogInformation("Diff update applied successfully.");
+            _logger.LogInformation("Starting differential update with --append mode...");
+            await ExecuteOsm2PgSql(tempDiffPath, "--append --slim --cache 1000");
+            _logger.LogInformation("Differential update completed successfully.");
         }
         finally
         {
@@ -119,9 +157,6 @@ public class MapUpdateWorker : BackgroundService
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Download helper
-    // ─────────────────────────────────────────────────────────────────────────
     private async Task DownloadFile(string url, string dest)
     {
         _logger.LogInformation("Downloading {Url} → {Dest}", url, dest);
@@ -180,9 +215,6 @@ public class MapUpdateWorker : BackgroundService
         return drive.AvailableFreeSpace > requiredBytes * 1.2;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  URL scraping
-    // ─────────────────────────────────────────────────────────────────────────
     private async Task<string> GetLatestUrl(string pageUrl, string pattern)
     {
         try
@@ -190,147 +222,71 @@ public class MapUpdateWorker : BackgroundService
             using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
             string html = await client.GetStringAsync(pageUrl);
             var matches = Regex.Matches(html, pattern);
-            if (matches.Count == 0)
-                return string.Empty;  // FIX 2: was null! — inconsistent with IsNullOrEmpty checks
-
+            if (matches.Count == 0) return string.Empty;
             return new Uri(new Uri(pageUrl), matches[^1].Groups[1].Value).ToString();
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error fetching URL: {Url}", pageUrl);
-            return string.Empty;  // FIX 2: was null!
+            return string.Empty;
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  osm2pgsql execution
-    // ─────────────────────────────────────────────────────────────────────────
     private async Task ExecuteOsm2PgSql(string tempPath, string extraArgs)
     {
         if (!File.Exists(tempPath))
             throw new FileNotFoundException($"File not found before import: {tempPath}");
 
-        string host = _settings["PgHost"] ?? "localhost";
-        string port = _settings["PgPort"] ?? "5432";
-        string database = _settings["PgDatabase"]!;
-        string user = _settings["PgUser"] ?? "postgres";
+        string connStr = _config.GetConnectionString("DefaultConnection")!;
+        string host = GetConnPart(connStr, "Host") ?? "localhost";
+        string port = GetConnPart(connStr, "Port") ?? "5432";
+        string database = GetConnPart(connStr, "Database") ?? throw new Exception("Database not found in ConnectionString");
+        string user = GetConnPart(connStr, "Username") ?? "postgres";
+        string password = GetConnPart(connStr, "Password") ?? "";
 
-        string styleArg = ResolveStyleArg();  // ✅ Use the comprehensive resolver
+        string styleArg = ResolveStyleArg();
 
-        // نستخدم الاسم كما هو في الإعدادات
         string args = $"{extraArgs} {styleArg} -H {host} -P {port} -d {database} -U {user} \"{tempPath}\"";
 
+        _logger.LogInformation("Running osm2pgsql on database: {Database}", database);
         _logger.LogInformation("Running osm2pgsql with args: {Args}", args);
-        await ExecuteCommand(_osm2pgsqlPath, args);
+
+        await ExecuteCommand(_osm2pgsqlPath, args, password);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Resolve the style / output argument (flex vs. pgsql)
-    // ─────────────────────────────────────────────────────────────────────────
+    // ✅ يدور على default.style الموجود جنب الـ exe - بدون lua
     private string ResolveStyleArg()
     {
-        string configuredStyle = _settings["Osm2PgsqlStyleFile"]!;
+        string exeDir = Path.GetDirectoryName(_osm2pgsqlPath)!;
 
-        // ── 1 & 2: explicitly configured path ────────────────────────────────
-        if (!string.IsNullOrEmpty(configuredStyle))
-        {
-            if (!File.Exists(configuredStyle))
-            {
-                _logger.LogWarning(
-                    "Configured Osm2PgsqlStyleFile not found: {Path}. " +
-                    "Will search next to the osm2pgsql binary instead.",
-                    configuredStyle);
-            }
-            else
-            {
-                return BuildStyleArg(configuredStyle);
-            }
-        }
-
-        // ── 3 & 4: search next to the exe (the ZIP bundles style files there) ─
-        string exeDir = Path.GetDirectoryName(_osm2pgsqlPath) ?? "";
-
-        // Prefer any .lua file (flex output) — avoids the deprecation warning
-        string? luaFile = Directory
-            .GetFiles(exeDir, "*.lua", SearchOption.TopDirectoryOnly)
-            .FirstOrDefault();
-
-        if (luaFile is not null)
-        {
-            _logger.LogInformation("Using bundled Lua style: {File}", luaFile);
-            return BuildStyleArg(luaFile);
-        }
-
-        // Fall back to .style file next to the exe
+        // أولاً: دور على default.style
         string? styleFile = Directory
-            .GetFiles(exeDir, "*.style", SearchOption.TopDirectoryOnly)
+            .GetFiles(exeDir, "*.style", SearchOption.AllDirectories)
+            .FirstOrDefault(f => Path.GetFileName(f) == "default.style");
+
+        // ثانياً: لو مش لاقي default.style خد أي .style موجود
+        styleFile ??= Directory
+            .GetFiles(exeDir, "*.style", SearchOption.AllDirectories)
             .FirstOrDefault();
 
         if (styleFile is not null)
         {
-            _logger.LogInformation("Using bundled legacy style: {File}", styleFile);
-            return BuildStyleArg(styleFile);
+            _logger.LogInformation("Using style file: {File}", styleFile);
+            return $"-S \"{styleFile}\"";
         }
 
-        // ── 5: nothing found — omit -S entirely ──────────────────────────────
-        _logger.LogWarning(
-            "No style file found. osm2pgsql will use its built-in default " +
-            "(deprecated pgsql output). Consider adding a Lua style file.");
-        return string.Empty;
+        throw new Exception(
+            $"No .style file found next to osm2pgsql in: {exeDir}. " +
+            "Please ensure default.style exists in the osm2pgsql folder.");
     }
 
-    private static string BuildStyleArg(string stylePath)
-    {
-        bool isLua = stylePath.EndsWith(".lua", StringComparison.OrdinalIgnoreCase);
-        return isLua
-            ? $"--output=flex -S \"{stylePath}\""
-            : $"-S \"{stylePath}\"";
-    }
+    private static string? GetConnPart(string connStr, string key) =>
+        connStr.Split(';')
+               .Select(p => p.Split('=', 2))
+               .FirstOrDefault(kv => kv.Length == 2 &&
+                    kv[0].Trim().Equals(key, StringComparison.OrdinalIgnoreCase))?[1].Trim();
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Database setup
-    // ─────────────────────────────────────────────────────────────────────────
-    private async Task SetupDatabase(string binPath)
-    {
-        // Fix: Dynamic extension for Linux vs Windows
-        string exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "psql.exe" : "psql";
-        string psql = Path.Combine(binPath, exeName);
-
-        string dbName = _mapSettings["PgDatabase"]!;
-        string user = _mapSettings["PgUser"]!;
-        string host = _mapSettings["PgHost"]!;
-
-        // Use quotes to handle case-sensitive names properly in PostgreSQL
-        string quotedDbName = $"\\\"{dbName}\\\"";
-
-        if (await IsDatabaseExists())
-        {
-            _logger.LogInformation("Database {DbName} exists.", dbName);
-            return;
-        }
-
-        _logger.LogInformation("Creating database: {DbName}", dbName);
-        await ExecuteCommand(psql, $"-U {user} -h {host} -d postgres -c \"CREATE DATABASE {quotedDbName};\"");
-
-        // PostGIS creation
-        await ExecuteCommand(psql, $"-U {user} -h {host} -d {quotedDbName} -c \"CREATE EXTENSION IF NOT EXISTS postgis;\"");
-    }
-
-    private string? FindPostgresBinPath(string root)
-    {
-        if (!Directory.Exists(root)) return null;
-        return Directory.GetDirectories(root)
-            .Select(d => new DirectoryInfo(d))
-            .Where(di => int.TryParse(di.Name, out _))
-            .OrderByDescending(di => int.Parse(di.Name))
-            .Select(di => Path.Combine(di.FullName, "bin"))
-            .FirstOrDefault();
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Process runner
-    // ─────────────────────────────────────────────────────────────────────────
-    private async Task<string> ExecuteCommand(string fileName, string args)
+    private async Task<string> ExecuteCommand(string fileName, string args, string pgPassword = "")
     {
         using var process = new Process();
         process.StartInfo = new ProcessStartInfo
@@ -343,8 +299,7 @@ public class MapUpdateWorker : BackgroundService
             CreateNoWindow = true
         };
 
-        process.StartInfo.EnvironmentVariables["PGPASSWORD"] = _config["MapSettings:PgPassword"]!;
-
+        process.StartInfo.EnvironmentVariables["PGPASSWORD"] = pgPassword;
         process.Start();
 
         string output = await process.StandardOutput.ReadToEndAsync();
@@ -358,67 +313,10 @@ public class MapUpdateWorker : BackgroundService
         return output;
     }
 
-    private async Task<bool> IsDatabaseExists()
-    {
-        try
-        {
-            string pgRoot = _mapSettings["PostgreSqlRootPath"]!;
-            string? binPath = FindPostgresBinPath(pgRoot);
-            if (binPath is null)
-            {
-                _logger.LogWarning("PostgreSQL bin path not found.");
-                return false;
-            }
-
-            // تحديد اسم الملف التنفيذي بناءً على نظام التشغيل
-            string exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "psql.exe" : "psql";
-            string psqlPath = Path.Combine(binPath, exeName);
-
-            // الاسم الأصلي من الإعدادات للإنشاء (لا نستخدم Lower هنا)
-            string dbName = _mapSettings["PgDatabase"]!;
-            // الاسم بصيغة Lower للتحقق داخل قاعدة بيانات PostgreSQL
-            string dbNameLower = dbName;
-
-            string user = _mapSettings["PgUser"]!;
-            string host = _mapSettings["PgHost"]!;
-
-            // أمر التحقق: نتصل بقاعدة بيانات 'postgres' الافتراضية للبحث عن وجود قاعدة البيانات الأخرى
-            // نستخدم -d postgres لضمان الاتصال الناجح قبل الاستعلام
-            string checkCmd = $"-U {user} -h {host} -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='{dbNameLower}'\"";
-
-            string result = await ExecuteCommand(psqlPath, checkCmd);
-
-            bool exists = result?.Trim() == "1";
-
-            if (exists)
-                _logger.LogInformation("Database '{DbName}' found.", dbName);
-            else
-                _logger.LogInformation("Database '{DbName}' does not exist.", dbName);
-
-            return exists;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error checking if database exists.");
-            return false;
-        }
-    }
     private async Task EnsureOsm2PgSqlExists(string targetFolder)
     {
         bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         string exeName = isWindows ? "osm2pgsql.exe" : "osm2pgsql";
-
-        // 1. فحص هل هو موجود مسبقاً (سواء في المسار المخصص أو على الـ PATH)
-        string? existingExe = FindExecutable(targetFolder, exeName);
-        if (existingExe != null)
-        {
-            _osm2pgsqlPath = existingExe;
-            _logger.LogInformation("osm2pgsql found at: {Path}", _osm2pgsqlPath);
-            return;
-        }
-
-        _logger.LogInformation("osm2pgsql not found. Initializing installation for {OS}...",
-            isWindows ? "Windows" : "Linux");
 
         if (isWindows)
             await EnsureOsm2PgSqlWindows(targetFolder, exeName);
@@ -426,29 +324,25 @@ public class MapUpdateWorker : BackgroundService
             await EnsureOsm2PgSqlLinux(exeName);
     }
 
-    // دالة ذكية للبحث عن الملف في كل مكان
-    private string? FindExecutable(string targetFolder, string exeName)
-    {
-        // أ- البحث في مجلد المشروع (targetFolder)
-        if (Directory.Exists(targetFolder))
-        {
-            var found = Directory.GetFiles(targetFolder, exeName, SearchOption.AllDirectories).FirstOrDefault();
-            if (found != null) return found;
-        }
-
-        // ب- البحث في الـ PATH (مفيد جداً للينكس إذا تم تثبيته بـ apt)
-        string pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
-        return pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
-                      .Select(dir => Path.Combine(dir, exeName))
-                      .FirstOrDefault(File.Exists);
-    }
-
     private async Task EnsureOsm2PgSqlWindows(string targetFolder, string exeName)
     {
         string folder = Path.Combine(targetFolder, "osm2pgsql_bin");
-        string downloadUrl = await ScrapeWindowsDownloadUrl(); // الرابط الديناميكي
 
-        _logger.LogInformation("Downloading latest osm2pgsql from: {Url}", downloadUrl);
+        string? existingExe = Directory.Exists(folder)
+            ? Directory.GetFiles(folder, exeName, SearchOption.AllDirectories).FirstOrDefault()
+            : null;
+
+        if (existingExe is not null)
+        {
+            _osm2pgsqlPath = existingExe;
+            _logger.LogInformation("osm2pgsql already present at: {Path}", _osm2pgsqlPath);
+            return;
+        }
+
+        string listingUrl = _settings["Osm2PgsqlUrl"]!;
+        string downloadUrl = await ScrapeWindowsDownloadUrl(listingUrl);
+
+        _logger.LogInformation("Downloading osm2pgsql from: {Url}", downloadUrl);
 
         string archivePath = Path.Combine(Path.GetTempPath(), $"osm2pgsql_{Guid.NewGuid()}.zip");
         Directory.CreateDirectory(folder);
@@ -460,21 +354,24 @@ public class MapUpdateWorker : BackgroundService
             response.EnsureSuccessStatusCode();
             await File.WriteAllBytesAsync(archivePath, await response.Content.ReadAsByteArrayAsync());
 
+            _logger.LogInformation("Extracting archive to: {Folder}", folder);
             ZipFile.ExtractToDirectory(archivePath, folder, overwriteFiles: true);
 
-            _osm2pgsqlPath = Directory.GetFiles(folder, exeName, SearchOption.AllDirectories).First();
-            _logger.LogInformation("osm2pgsql installed successfully at: {Path}", _osm2pgsqlPath);
+            string? found = Directory.GetFiles(folder, exeName, SearchOption.AllDirectories).FirstOrDefault();
+            if (found is null)
+                throw new Exception($"osm2pgsql.exe not found anywhere under {folder} after extraction.");
+
+            _osm2pgsqlPath = found;
+            _logger.LogInformation("osm2pgsql ready at: {Path}", _osm2pgsqlPath);
         }
         finally
         {
             if (File.Exists(archivePath)) File.Delete(archivePath);
         }
     }
-  
-    // ── Linux: install via apt (no prebuilt binaries exist on osm2pgsql.org) ─
+
     private async Task EnsureOsm2PgSqlLinux(string exeName)
     {
-        // Check if already on PATH (installed by apt or previously by this method)
         string? onPath = FindOnPath(exeName);
         if (onPath is not null)
         {
@@ -483,43 +380,34 @@ public class MapUpdateWorker : BackgroundService
             return;
         }
 
-        _logger.LogInformation(
-            "osm2pgsql not found. Installing via apt-get...");
-
+        _logger.LogInformation("osm2pgsql not found. Installing via apt-get...");
         await ExecuteCommand("apt-get", "update -qq");
         await ExecuteCommand("apt-get", "install -y osm2pgsql");
 
-        // Re-check PATH after install
         onPath = FindOnPath(exeName);
         if (onPath is null)
-            throw new Exception(
-                "osm2pgsql was not found on PATH even after apt-get install. " +
-                "Please install it manually: sudo apt-get install osm2pgsql");
+            throw new Exception("osm2pgsql was not found on PATH even after apt-get install.");
 
         _osm2pgsqlPath = onPath;
         _logger.LogInformation("osm2pgsql installed at: {Path}", _osm2pgsqlPath);
     }
 
-    // ── Scrape the Windows directory listing as a fallback ───────────────────
-    private async Task<string> ScrapeWindowsDownloadUrl()
+    private async Task<string> ScrapeWindowsDownloadUrl(string listingUrl)
     {
-        // استخدام الرابط الموجود في الـ appsettings.json
-        string listingUrl = _mapSettings["Osm2PgsqlUrl"]!;
-
         _logger.LogInformation("Scraping directory listing: {Url}", listingUrl);
 
         using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
         string html = await client.GetStringAsync(listingUrl);
-
-        // Regex يطابق الملفات المعتادة لنسخة الويندوز
         var matches = Regex.Matches(html, @"(osm2pgsql-[\d.]+-x64\.zip)");
 
         if (matches.Count == 0)
-            throw new Exception($"Could not find any download links on: {listingUrl}");
+            throw new Exception($"Could not find any osm2pgsql download links on: {listingUrl}");
 
-        string newest = matches.Cast<Match>()
+        string newest = matches
+            .Cast<Match>()
             .Select(m => m.Groups[1].Value)
-            .OrderByDescending(name => {
+            .OrderByDescending(name =>
+            {
                 var v = Regex.Match(name, @"(\d+\.\d+\.\d+)");
                 return v.Success ? Version.Parse(v.Groups[1].Value) : new Version(0, 0);
             })
@@ -527,7 +415,7 @@ public class MapUpdateWorker : BackgroundService
 
         return new Uri(new Uri(listingUrl), newest).ToString();
     }
-    // ── Helper: find an executable on the system PATH ────────────────────────
+
     private static string? FindOnPath(string exeName)
     {
         string pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";

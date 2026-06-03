@@ -1,11 +1,9 @@
 using GIsDataWorker;
 using GIsDataWorker.Models;
- using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using System.Runtime.InteropServices;
 
-// ── Fix content root so appsettings.json is found from the .exe folder,
-//    not System32 (which is the default working directory for Windows Services)
 var options = new HostApplicationBuilderSettings
 {
     Args = args,
@@ -16,7 +14,6 @@ var options = new HostApplicationBuilderSettings
 
 var builder = Host.CreateApplicationBuilder(options);
 
-// ── Load config from the exe's folder (critical for services)
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -26,23 +23,46 @@ builder.Configuration
         reloadOnChange: true)
     .AddEnvironmentVariables();
 
-// ── Windows Service lifetime + Windows Event Log
 builder.Services.AddWindowsService(o =>
 {
-    o.ServiceName = builder.Configuration["WindowsService:ServiceName"] !;
+    o.ServiceName = builder.Configuration["WindowsService:ServiceName"]!;
 });
 
-
-// ── Database
 builder.Services.AddDbContext<ApplicationDbContext>(dbOptions =>
     dbOptions.UseNpgsql(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-    x => x.UseNetTopologySuite()));
- 
-// ── Hosted services
+        x => x.UseNetTopologySuite()));
+
 builder.Services.AddHostedService<Worker>();
 builder.Services.AddHostedService<MapUpdateWorker>();
 
- 
 var host = builder.Build();
+
+// ── Auto-migrate on startup ✅
+using (var scope = host.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+    var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
+
+    try
+    {
+        var pending = await db.Database.GetPendingMigrationsAsync();
+        if (pending.Any())
+        {
+            logger.LogInformation("Applying {Count} pending migration(s)...", pending.Count());
+            await db.Database.MigrateAsync();
+            logger.LogInformation("Migrations applied successfully.");
+        }
+        else
+        {
+            logger.LogInformation("Database is up to date. No migrations needed.");
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to apply migrations.");
+        throw;
+    }
+}
+
 host.Run();
