@@ -1,6 +1,6 @@
 using GIsDataWorker;
 using GIsDataWorker.Models;
-using Microsoft.EntityFrameworkCore;
+ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using System.Runtime.InteropServices;
 
@@ -32,16 +32,17 @@ builder.Services.AddWindowsService(o =>
     o.ServiceName = builder.Configuration["WindowsService:ServiceName"] !;
 });
 
- 
+
 // ── Database
 builder.Services.AddDbContext<ApplicationDbContext>(dbOptions =>
     dbOptions.UseNpgsql(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-        x => x.UseNetTopologySuite()));
-
+    x => x.UseNetTopologySuite()));
+ 
 // ── Hosted services
 builder.Services.AddHostedService<Worker>();
 builder.Services.AddHostedService<MapUpdateWorker>();
 
+ 
 var host = builder.Build();
 host.Run();

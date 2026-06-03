@@ -11,7 +11,7 @@ public class MapUpdateWorker : BackgroundService
     private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
      private string _osm2pgsqlPath = string.Empty;
     private IConfigurationSection _settings => _mapSettings;
-
+ 
     public MapUpdateWorker(ILogger<MapUpdateWorker> logger, IConfiguration config)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -19,6 +19,9 @@ public class MapUpdateWorker : BackgroundService
         _mapSettings = _config.GetSection("MapSettings");
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Main loop
+    // ─────────────────────────────────────────────────────────────────────────
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
@@ -41,6 +44,7 @@ public class MapUpdateWorker : BackgroundService
                     await ApplyDiffUpdate();
                 else
                     await RunFullImport();
+                }
             }
             catch (Exception ex)
             {
@@ -49,9 +53,9 @@ public class MapUpdateWorker : BackgroundService
             finally
             {
                 _lock.Release();
-            }
-            await Task.Delay(TimeSpan.FromDays(30), stoppingToken);
         }
+            await Task.Delay(TimeSpan.FromDays(30), stoppingToken);
+    }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -79,7 +83,7 @@ public class MapUpdateWorker : BackgroundService
                 throw new Exception($"Download produced an empty or missing file at: {tempPath}");
 
             await ExecuteOsm2PgSql(tempPath, "--slim -s");
-            _logger.LogInformation("Full import completed successfully.");
+             _logger.LogInformation("Full import completed successfully.");
         }
         finally
         {
@@ -100,12 +104,14 @@ public class MapUpdateWorker : BackgroundService
             return;
         }
 
+
+
         string tempDiffPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".osc.gz");
         try
         {
             await DownloadFile(diffUrl, tempDiffPath);
             await ExecuteOsm2PgSql(tempDiffPath, "--append");
-            _logger.LogInformation("Diff update applied successfully.");
+             _logger.LogInformation("Diff update applied successfully.");
         }
         finally
         {
@@ -211,6 +217,7 @@ public class MapUpdateWorker : BackgroundService
 
         string styleArg = ResolveStyleArg();  // ✅ Use the comprehensive resolver
 
+        // نستخدم الاسم كما هو في الإعدادات
         string args = $"{extraArgs} {styleArg} -H {host} -P {port} -d {database} -U {user} \"{tempPath}\"";
 
         _logger.LogInformation("Running osm2pgsql with args: {Args}", args);
