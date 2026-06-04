@@ -6,7 +6,7 @@ public class MapSettings
     public string BaseUrl { get; set; } = string.Empty;
     public string UpdatesUrl { get; set; } = string.Empty;
     public string? Osm2PgsqlFolder { get; set; }
-    public string? StyleFile { get; set; }  // ✅ Added
+    public string? StyleFile { get; set; }   
 }
 
 public class PostgresSettings

@@ -8,6 +8,17 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="osm2pgsql_bin\**" />
+    <Compile Remove="tools\**" />
+    <Content Remove="osm2pgsql_bin\**" />
+    <Content Remove="tools\**" />
+    <EmbeddedResource Remove="osm2pgsql_bin\**" />
+    <EmbeddedResource Remove="tools\**" />
+    <None Remove="osm2pgsql_bin\**" />
+    <None Remove="tools\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" Version="8.0.8" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.8">
       <PrivateAssets>all</PrivateAssets>

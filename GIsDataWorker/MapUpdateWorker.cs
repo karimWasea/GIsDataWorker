@@ -61,17 +61,7 @@ public class MapUpdateWorker : BackgroundService
             {
                 bool dbExists = await IsDatabaseExists();
 
-                if (!dbExists)
-                {
-                    _logger.LogInformation("Database not found. Creating and running full import...");
-                    await SetupDatabase();
-                    await RunFullImport();
-                }
-                else
-                {
-                    bool osmInitialized = await IsOsmDataImported();
-
-                    if (!osmInitialized)
+                    if (!dbExists)
                     {
                         _logger.LogInformation("Database exists but OSM data not imported. Running full import...");
                         await RunFullImport();
@@ -81,14 +71,14 @@ public class MapUpdateWorker : BackgroundService
                         _logger.LogInformation("OSM data exists. Checking for updates...");
                         await ApplyDiffUpdate();
                     }
-                }
+                
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in processing loop.");
             }
 
-            await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
+            await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
         }
     }
 
@@ -127,33 +117,46 @@ public class MapUpdateWorker : BackgroundService
     // ─────────────────────────────────────────────────────────────────────────
     //  Diff update
     // ─────────────────────────────────────────────────────────────────────────
+    private static string EnsureTrailingSlash(string url) =>
+    url.EndsWith("/") ? url : url + "/";
+
     private async Task ApplyDiffUpdate()
     {
-        string updatesUrl = _mapSettings.UpdatesUrl;
-        if (string.IsNullOrWhiteSpace(updatesUrl))
-            throw new InvalidOperationException("MapSettings:UpdatesUrl missing from appsettings.json.");
+        string updatesUrl = EnsureTrailingSlash(_mapSettings.UpdatesUrl);
 
-        string diffUrl = await GetLatestUrl(updatesUrl, @"href=""([^""]+osc\.gz)""");
-        if (string.IsNullOrEmpty(diffUrl))
+        // تأكد من أن الرابط يبدأ بـ https
+        if (!updatesUrl.StartsWith("http"))
         {
-            _logger.LogInformation("No diff updates available at this time.");
+            _logger.LogError("Invalid URL format: {Url}", updatesUrl);
             return;
         }
 
-        string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".osc.gz");
         try
         {
-            await DownloadFile(diffUrl, tempPath);
-            _logger.LogInformation("Starting differential update (--append)...");
-            await ExecuteOsm2PgSql(tempPath, "--append --slim --cache 1000");
-            _logger.LogInformation("Diff update applied successfully.");
+            // اختبار الاتصال بالخادم أولاً
+            using var client = new HttpClient();
+            var response = await client.GetAsync(updatesUrl);
+            response.EnsureSuccessStatusCode();
+
+            string diffUrl = await GetLatestUrl(updatesUrl, @"href=""([^""]+osc\.gz)""");
+
+            if (string.IsNullOrEmpty(diffUrl))
+            {
+                _logger.LogInformation("No diff updates available.");
+                return;
+            }
+
+            // كمل باقي منطق التحميل هنا...
         }
-        finally
+        catch (HttpRequestException ex) when (ex.InnerException is System.Net.Sockets.SocketException)
         {
-            if (File.Exists(tempPath)) File.Delete(tempPath);
+            _logger.LogError("DNS Error: Cannot resolve download.geofabrik.de. Check your internet/DNS settings.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during update process.");
         }
     }
-
     // ─────────────────────────────────────────────────────────────────────────
     //  Download helper
     // ─────────────────────────────────────────────────────────────────────────
@@ -301,43 +304,9 @@ public class MapUpdateWorker : BackgroundService
             ? $"--output=flex -S \"{stylePath}\""
             : $"-S \"{stylePath}\"";
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Database helpers
-    // ─────────────────────────────────────────────────────────────────────────
-    private async Task SetupDatabase()
-    {
-        string psql = _psqlPath!;
+ 
 
-        if (await IsDatabaseExists())
-        {
-            _logger.LogInformation("Database '{Database}' already exists, skipping creation.",
-                _postgresSettings.Database);
-            return;
-        }
-
-        _logger.LogInformation("Creating database '{Database}'...", _postgresSettings.Database);
-
-        // ✅ Fixed: was _settings.Database
-        await RunPsql(psql, "postgres",
-            $"CREATE DATABASE \"{_postgresSettings.Database}\";");
-
-        _logger.LogInformation("Enabling PostGIS on '{Database}'...", _postgresSettings.Database);
-        await RunPsql(psql, _postgresSettings.Database,
-            "CREATE EXTENSION IF NOT EXISTS postgis;");
-
-        _logger.LogInformation("Database '{Database}' created with PostGIS.", _postgresSettings.Database);
-    }
-
-    private async Task RunPsql(string psqlExe, string targetDb, string sql)
-    {
-        // ✅ Fixed: was _settings.* throughout
-        string escapedSql = sql.Replace("\"", "\\\"");
-        string args = $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
-                      $"-p {_postgresSettings.Port} -d {targetDb} -c \"{escapedSql}\"";
-
-        _logger.LogInformation("psql → {Sql}", sql);
-        await ExecuteCommand(psqlExe, args, _postgresSettings.Password);
-    }
+    
 
     private async Task<bool> IsDatabaseExists()
     {
@@ -345,56 +314,51 @@ public class MapUpdateWorker : BackgroundService
         {
             string psql = _psqlPath!;
 
-            // ✅ Fixed: was _settings.*; also sanitized db name
             string safeDbName = _postgresSettings.Database.Replace("'", "''");
-            string args = $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
-                          $"-p {_postgresSettings.Port} -d postgres -tAc " +
-                          $"\"SELECT 1 FROM pg_database WHERE datname='{safeDbName}'\"";
 
-            string result = await ExecuteCommand(psql, args, _postgresSettings.Password);
-            bool exists = result.Trim() == "1";
+            // 1. check database exists
+            string existsArgs =
+                $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
+                $"-p {_postgresSettings.Port} -d postgres -tAc " +
+                $"\"SELECT 1 FROM pg_database WHERE datname='{safeDbName}'\"";
+
+            string existsResult = await ExecuteCommand(psql, existsArgs, _postgresSettings.Password);
+            bool dbExists = existsResult.Trim() == "1";
+
+            if (!dbExists)
+            {
+                _logger.LogInformation("Database '{DB}' does not exist.", _postgresSettings.Database);
+                return false;
+            }
+
+            // 2. check planet_osm_point exists + has data
+            string dataArgs =
+                $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
+                $"-p {_postgresSettings.Port} -d {_postgresSettings.Database} -tAc " +
+                "\"SELECT COUNT(*) FROM planet_osm_point\"";
+
+            string dataResult = await ExecuteCommand(psql, dataArgs, _postgresSettings.Password);
+
+            if (!long.TryParse(dataResult.Trim(), out var count))
+                count = 0;
+
+            bool hasData = count > 0;
 
             _logger.LogInformation(
-                exists ? "Database '{DB}' found." : "Database '{DB}' does not exist.",
+                hasData
+                    ? "Database '{DB}' has planet_osm_point with data."
+                    : "Database '{DB}' exists but planet_osm_point is empty.",
                 _postgresSettings.Database);
 
-            return exists;
+            return hasData;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error checking if database exists.");
+            _logger.LogError(ex, "Error checking database or planet_osm_point.");
             return false;
         }
     }
-
-    private async Task<bool> IsOsmDataImported()
-    {
-        try
-        {
-            string psql = _psqlPath!;
-
-            // ✅ Fixed: was _settings.*
-            string args = $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
-                          $"-p {_postgresSettings.Port} -d {_postgresSettings.Database} -tAc " +
-                          "\"SELECT COUNT(*) FROM information_schema.tables " +
-                          "WHERE table_name='osm2pgsql_properties' AND table_schema='public'\"";
-
-            string result = await ExecuteCommand(psql, args, _postgresSettings.Password);
-            bool imported = result.Trim() == "1";
-
-            _logger.LogInformation(
-                imported ? "OSM data found in '{DB}'." : "OSM data NOT yet imported into '{DB}'.",
-                _postgresSettings.Database);
-
-            return imported;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error checking OSM data status.");
-            return false;
-        }
-    }
-
+     
     // ─────────────────────────────────────────────────────────────────────────
     //  Process runner
     // ─────────────────────────────────────────────────────────────────────────
@@ -573,12 +537,13 @@ public class MapUpdateWorker : BackgroundService
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            var searchRoots = new[]
-            {
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                @"C:\PostgreSQL",
-            };
+            var systemDrive = Environment.GetEnvironmentVariable("SystemDrive") !;
+var searchRoots = new[]
+{
+    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+    Path.Combine(systemDrive, "PostgreSQL"),
+};
 
             foreach (string baseDir in searchRoots.Where(d => !string.IsNullOrEmpty(d)))
             {
