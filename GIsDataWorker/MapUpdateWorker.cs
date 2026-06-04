@@ -1,3 +1,7 @@
+using GIsDataWorker.Models;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -8,34 +12,23 @@ using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 
 public class MapUpdateWorker : BackgroundService
 {
     private readonly ILogger<MapUpdateWorker> _logger;
-    private readonly IConfiguration _config;
-    private readonly IConfigurationSection _mapSettings;
+    private readonly MapSettings _mapSettings;
+    private readonly PostgresSettings _postgresSettings;
     private string _osm2pgsqlPath = string.Empty;
-
-    // DB connection parts — parsed once from ConnectionStrings:DefaultConnection
-    private string _pgHost = "localhost";
-    private string _pgPort = "5432";
-    private string _pgDatabase = "";
-    private string _pgUser = "postgres";
-    private string _pgPassword = "";
-
-    // Cache psql path after first discovery
     private string? _psqlPath;
 
-    private IConfigurationSection _settings => _mapSettings;
-
-    public MapUpdateWorker(ILogger<MapUpdateWorker> logger, IConfiguration config)
+    public MapUpdateWorker(
+        ILogger<MapUpdateWorker> logger,
+        IOptions<MapSettings> mapSettings,
+        IOptions<PostgresSettings> postgresSettings)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _config = config;
-        _mapSettings = _config.GetSection("MapSettings");
+        _mapSettings = mapSettings?.Value ?? throw new ArgumentNullException(nameof(mapSettings));
+        _postgresSettings = postgresSettings?.Value ?? throw new ArgumentNullException(nameof(postgresSettings));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -43,20 +36,15 @@ public class MapUpdateWorker : BackgroundService
     // ─────────────────────────────────────────────────────────────────────────
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // 1. Parse ALL settings from appsettings.json / connection string
-        LoadDbSettings();
-
-        // 2. Resolve & cache psql once at startup so we fail fast if missing
         _psqlPath = FindPsqlOnPath()
             ?? throw new Exception(
                 "psql not found. Add PostgreSQL bin to PATH, or set the " +
                 "PSQL_PATH environment variable to the full path of psql.exe.");
         _logger.LogInformation("psql found at: {Path}", _psqlPath);
 
-        // 3. Ensure osm2pgsql is present
         try
         {
-            string osm2pgsqlFolder = _settings["Osm2PgsqlFolder"]
+            string osm2pgsqlFolder = _mapSettings.Osm2PgsqlFolder
                 ?? Path.Combine(AppContext.BaseDirectory, "tools");
             await EnsureOsm2PgSqlExists(osm2pgsqlFolder);
             _logger.LogInformation("osm2pgsql is ready at: {Path}", _osm2pgsqlPath);
@@ -105,43 +93,14 @@ public class MapUpdateWorker : BackgroundService
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Parse ALL DB settings from ConnectionStrings:DefaultConnection
-    //  (nothing is hard-coded — everything comes from appsettings.json)
-    // ─────────────────────────────────────────────────────────────────────────
-    private void LoadDbSettings()
-    {
-        string connStr = _config.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException(
-                "ConnectionStrings:DefaultConnection is missing from appsettings.json.");
-
-        _pgHost = GetConnPart(connStr, "Host") ?? "localhost";
-        _pgPort = GetConnPart(connStr, "Port") ?? "5432";
-        _pgDatabase = GetConnPart(connStr, "Database")
-            ?? throw new InvalidOperationException(
-                "Database key not found in ConnectionStrings:DefaultConnection.");
-        _pgUser = GetConnPart(connStr, "Username") ?? "postgres";
-        _pgPassword = GetConnPart(connStr, "Password") ?? "";
-
-        _logger.LogInformation(
-            "DB config loaded → Host={Host} Port={Port} Database={Database} User={User}",
-            _pgHost, _pgPort, _pgDatabase, _pgUser);
-    }
-
-    private static string? GetConnPart(string connStr, string key) =>
-        connStr.Split(';')
-               .Select(p => p.Split('=', 2))
-               .FirstOrDefault(kv =>
-                    kv.Length == 2 &&
-                    kv[0].Trim().Equals(key, StringComparison.OrdinalIgnoreCase))
-               ?[1].Trim();
-
-    // ─────────────────────────────────────────────────────────────────────────
     //  Full import
     // ─────────────────────────────────────────────────────────────────────────
     private async Task RunFullImport()
     {
-        string baseUrl = _settings["BaseUrl"]
-            ?? throw new InvalidOperationException("MapSettings:BaseUrl missing from appsettings.json.");
+        string baseUrl = _mapSettings.BaseUrl;
+        if (string.IsNullOrWhiteSpace(baseUrl))
+            throw new InvalidOperationException("MapSettings:BaseUrl missing from appsettings.json.");
+
         string downloadUrl = await GetLatestUrl(baseUrl, @"href=""([^""]+latest\.osm\.pbf)""");
         if (string.IsNullOrEmpty(downloadUrl))
             throw new Exception("Could not find full map download URL.");
@@ -170,8 +129,10 @@ public class MapUpdateWorker : BackgroundService
     // ─────────────────────────────────────────────────────────────────────────
     private async Task ApplyDiffUpdate()
     {
-        string updatesUrl = _settings["UpdatesUrl"]
-            ?? throw new InvalidOperationException("MapSettings:UpdatesUrl missing from appsettings.json.");
+        string updatesUrl = _mapSettings.UpdatesUrl;
+        if (string.IsNullOrWhiteSpace(updatesUrl))
+            throw new InvalidOperationException("MapSettings:UpdatesUrl missing from appsettings.json.");
+
         string diffUrl = await GetLatestUrl(updatesUrl, @"href=""([^""]+osc\.gz)""");
         if (string.IsNullOrEmpty(diffUrl))
         {
@@ -282,25 +243,27 @@ public class MapUpdateWorker : BackgroundService
 
         string styleArg = ResolveStyleArg();
 
-        // Build args — password is passed via PGPASSWORD env var, NOT on the command line
         string args = $"{extraArgs} {styleArg} " +
-                      $"-H {_pgHost} -P {_pgPort} -d {_pgDatabase} -U {_pgUser} " +
+                      $"-H {_postgresSettings.Host} -P {_postgresSettings.Port} " +
+                      $"-d {_postgresSettings.Database} -U {_postgresSettings.Username} " +
                       $"\"{filePath}\"";
 
         _logger.LogInformation("Running osm2pgsql with args: {Args}", args);
-        string output = await ExecuteCommand(_osm2pgsqlPath, args, _pgPassword);
 
-        // osm2pgsql writes progress to stderr (exit code 0 = success)
+        // ✅ Fixed: was _settings.Password
+        string output = await ExecuteCommand(_osm2pgsqlPath, args, _postgresSettings.Password);
+
         if (!string.IsNullOrWhiteSpace(output))
             _logger.LogInformation("osm2pgsql output: {Output}", output);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Style resolver (flex .lua → legacy .style → pgsimple fallback)
+    //  Style resolver
     // ─────────────────────────────────────────────────────────────────────────
     private string ResolveStyleArg()
     {
-        string configuredStyle = _settings["Osm2PgsqlStyleFile"] ?? "";
+        // ✅ Fixed: was Osm2PgsqlFolder (a folder path, not a style file)
+        string configuredStyle = _mapSettings.StyleFile ?? "";
         if (!string.IsNullOrEmpty(configuredStyle))
         {
             if (!File.Exists(configuredStyle))
@@ -339,42 +302,41 @@ public class MapUpdateWorker : BackgroundService
             : $"-S \"{stylePath}\"";
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Database helpers — all config comes from _pg* fields (appsettings.json)
+    //  Database helpers
     // ─────────────────────────────────────────────────────────────────────────
     private async Task SetupDatabase()
     {
-        // _psqlPath is guaranteed non-null; resolved once at startup
         string psql = _psqlPath!;
 
         if (await IsDatabaseExists())
         {
-            _logger.LogInformation("Database '{Database}' already exists, skipping creation.", _pgDatabase);
+            _logger.LogInformation("Database '{Database}' already exists, skipping creation.",
+                _postgresSettings.Database);
             return;
         }
 
-        _logger.LogInformation("Creating database '{Database}'...", _pgDatabase);
+        _logger.LogInformation("Creating database '{Database}'...", _postgresSettings.Database);
 
-        // Use single-quoted identifier inside the SQL string to avoid shell quoting hell
+        // ✅ Fixed: was _settings.Database
         await RunPsql(psql, "postgres",
-            $"CREATE DATABASE \"{_pgDatabase}\";");
+            $"CREATE DATABASE \"{_postgresSettings.Database}\";");
 
-        _logger.LogInformation("Enabling PostGIS on '{Database}'...", _pgDatabase);
-        await RunPsql(psql, _pgDatabase,
+        _logger.LogInformation("Enabling PostGIS on '{Database}'...", _postgresSettings.Database);
+        await RunPsql(psql, _postgresSettings.Database,
             "CREATE EXTENSION IF NOT EXISTS postgis;");
 
-        _logger.LogInformation("Database '{Database}' created with PostGIS.", _pgDatabase);
+        _logger.LogInformation("Database '{Database}' created with PostGIS.", _postgresSettings.Database);
     }
 
-    /// <summary>
-    /// Runs a single SQL statement via psql, targeting <paramref name="targetDb"/>.
-    /// Credentials and host are taken from the parsed connection string.
-    /// </summary>
     private async Task RunPsql(string psqlExe, string targetDb, string sql)
     {
-        // Pass the SQL via -c so no shell escaping issues with quoted identifiers
-        string args = $"-U {_pgUser} -h {_pgHost} -p {_pgPort} -d {targetDb} -c \"{sql}\"";
+        // ✅ Fixed: was _settings.* throughout
+        string escapedSql = sql.Replace("\"", "\\\"");
+        string args = $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
+                      $"-p {_postgresSettings.Port} -d {targetDb} -c \"{escapedSql}\"";
+
         _logger.LogInformation("psql → {Sql}", sql);
-        await ExecuteCommand(psqlExe, args, _pgPassword);
+        await ExecuteCommand(psqlExe, args, _postgresSettings.Password);
     }
 
     private async Task<bool> IsDatabaseExists()
@@ -382,15 +344,19 @@ public class MapUpdateWorker : BackgroundService
         try
         {
             string psql = _psqlPath!;
-            string args = $"-U {_pgUser} -h {_pgHost} -p {_pgPort} -d postgres -tAc " +
-                          $"\"SELECT 1 FROM pg_database WHERE datname='{_pgDatabase}'\"";
 
-            string result = await ExecuteCommand(psql, args, _pgPassword);
+            // ✅ Fixed: was _settings.*; also sanitized db name
+            string safeDbName = _postgresSettings.Database.Replace("'", "''");
+            string args = $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
+                          $"-p {_postgresSettings.Port} -d postgres -tAc " +
+                          $"\"SELECT 1 FROM pg_database WHERE datname='{safeDbName}'\"";
+
+            string result = await ExecuteCommand(psql, args, _postgresSettings.Password);
             bool exists = result.Trim() == "1";
 
             _logger.LogInformation(
                 exists ? "Database '{DB}' found." : "Database '{DB}' does not exist.",
-                _pgDatabase);
+                _postgresSettings.Database);
 
             return exists;
         }
@@ -406,16 +372,19 @@ public class MapUpdateWorker : BackgroundService
         try
         {
             string psql = _psqlPath!;
-            string args = $"-U {_pgUser} -h {_pgHost} -p {_pgPort} -d {_pgDatabase} -tAc " +
+
+            // ✅ Fixed: was _settings.*
+            string args = $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
+                          $"-p {_postgresSettings.Port} -d {_postgresSettings.Database} -tAc " +
                           "\"SELECT COUNT(*) FROM information_schema.tables " +
                           "WHERE table_name='osm2pgsql_properties' AND table_schema='public'\"";
 
-            string result = await ExecuteCommand(psql, args, _pgPassword);
+            string result = await ExecuteCommand(psql, args, _postgresSettings.Password);
             bool imported = result.Trim() == "1";
 
             _logger.LogInformation(
                 imported ? "OSM data found in '{DB}'." : "OSM data NOT yet imported into '{DB}'.",
-                _pgDatabase);
+                _postgresSettings.Database);
 
             return imported;
         }
@@ -444,11 +413,9 @@ public class MapUpdateWorker : BackgroundService
             }
         };
 
-        // Pass password via environment variable — safest, works on all platforms
         process.StartInfo.EnvironmentVariables["PGPASSWORD"] = pgPassword;
         process.Start();
 
-        // Read stdout and stderr concurrently to avoid deadlocks on large output
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync();
@@ -463,7 +430,6 @@ public class MapUpdateWorker : BackgroundService
                 $"{Path.GetFileName(fileName)} failed (exit {process.ExitCode}).\n{error}");
         }
 
-        // Log stderr as info for tools like osm2pgsql that write progress there
         if (!string.IsNullOrWhiteSpace(error))
             _logger.LogInformation("{Tool} stderr: {Err}", Path.GetFileName(fileName), error);
 
@@ -510,6 +476,8 @@ public class MapUpdateWorker : BackgroundService
     private async Task EnsureOsm2PgSqlWindows(string targetFolder, string exeName)
     {
         string folder = Path.Combine(targetFolder, "osm2pgsql_bin");
+
+        // ✅ Fixed: was _settings.Osm2PgsqlUrl
         string downloadUrl = await ScrapeWindowsDownloadUrl();
 
         _logger.LogInformation("Downloading osm2pgsql from: {Url}", downloadUrl);
@@ -562,8 +530,10 @@ public class MapUpdateWorker : BackgroundService
 
     private async Task<string> ScrapeWindowsDownloadUrl()
     {
-        string listingUrl = _mapSettings["Osm2PgsqlUrl"]
-            ?? throw new InvalidOperationException("MapSettings:Osm2PgsqlUrl missing from appsettings.json.");
+        // ✅ Fixed: was _settings.Osm2PgsqlUrl
+        string listingUrl = _mapSettings.Osm2PgsqlUrl;
+        if (string.IsNullOrWhiteSpace(listingUrl))
+            throw new InvalidOperationException("MapSettings:Osm2PgsqlUrl missing from appsettings.json.");
 
         _logger.LogInformation("Scraping osm2pgsql download page: {Url}", listingUrl);
 
@@ -588,29 +558,21 @@ public class MapUpdateWorker : BackgroundService
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  psql discovery — priority:
-    //    1. PSQL_PATH env var (manual override)
-    //    2. System PATH
-    //    3. All versioned PostgreSQL folders under Program Files (Windows)
-    //    4. Windows Registry (EnterpriseDB installer)
-    //    5. Versioned paths under /usr/lib/postgresql (Linux)
+    //  psql discovery
     // ─────────────────────────────────────────────────────────────────────────
     private static string? FindPsqlOnPath()
     {
         string exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "psql.exe" : "psql";
 
-        // 1. Explicit env var override
         string? envOverride = Environment.GetEnvironmentVariable("PSQL_PATH");
         if (!string.IsNullOrEmpty(envOverride) && File.Exists(envOverride))
             return envOverride;
 
-        // 2. System PATH
         string? onPath = FindOnPath(exeName);
         if (onPath != null) return onPath;
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            // 3. Scan Program Files for all installed PostgreSQL versions
             var searchRoots = new[]
             {
                 Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
@@ -639,13 +601,11 @@ public class MapUpdateWorker : BackgroundService
                 if (found != null) return found;
             }
 
-            // 4. Windows Registry (EnterpriseDB installer)
             string? regPath = GetPsqlFromRegistry(exeName);
             if (regPath != null) return regPath;
         }
         else
         {
-            // 5. Linux well-known + versioned paths
             var linuxCandidates = new[]
             {
                 "/usr/bin/psql",

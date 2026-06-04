@@ -14,16 +14,16 @@ var options = new HostApplicationBuilderSettings
 
 var builder = Host.CreateApplicationBuilder(options);
 // بعد builder.Services.AddDbContext
-builder.Services.Configure<MapSettings>(
-    builder.Configuration.GetSection(MapSettings.SectionName));
+builder.Services.Configure<MapSettings>(builder.Configuration.GetSection("MapSettings"));
+builder.Services.Configure<PostgresSettings>(builder.Configuration.GetSection("Postgres"));
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-    .AddJsonFile(
-        $"appsettings.{builder.Environment.EnvironmentName}.json",
-        optional: true,
-        reloadOnChange: true)
+    .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true)
     .AddEnvironmentVariables();
+
+ 
+ 
 
 builder.Services.AddWindowsService(o =>
 {
@@ -37,7 +37,8 @@ builder.Services.AddDbContext<ApplicationDbContext>(dbOptions =>
 
 builder.Services.AddHostedService<Worker>();
 builder.Services.AddHostedService<MapUpdateWorker>();
-
+ 
+ 
 var host = builder.Build();
 
 // ── Auto-migrate on startup ✅
@@ -66,5 +67,7 @@ using (var scope = host.Services.CreateScope())
         throw;
     }
 }
+
+
 
 host.Run();
