@@ -13,7 +13,9 @@ var options = new HostApplicationBuilderSettings
 };
 
 var builder = Host.CreateApplicationBuilder(options);
-
+// بعد builder.Services.AddDbContext
+builder.Services.Configure<MapSettings>(
+    builder.Configuration.GetSection(MapSettings.SectionName));
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
