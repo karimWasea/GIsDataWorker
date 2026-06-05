@@ -87,7 +87,7 @@ public sealed class Worker : BackgroundService
 
         var filtered = allRegions
             .Where(IsRelevantRegion)
-            .OrderBy(r => ParseAdminLevel(r.AdminLevel))
+            .OrderBy(r => ParseAdminLevelForSort(r.AdminLevel))
             .ToList();
 
         return (filtered, coord);
@@ -99,8 +99,10 @@ public sealed class Worker : BackgroundService
     {
         // Most specific region = highest admin level
         var specific = regions
-            .Where(r => int.TryParse(r.AdminLevel, out _))
-            .OrderByDescending(r => int.Parse(r.AdminLevel!))
+            .Select(r => (Region: r, Level: TryParseAdminLevel(r.AdminLevel, out var l) ? l : (int?)null))
+            .Where(x => x.Level.HasValue)
+            .OrderByDescending(x => x.Level)
+            .Select(x => x.Region)
             .FirstOrDefault()
             ?? regions[0];
 
@@ -130,8 +132,15 @@ public sealed class Worker : BackgroundService
 
     private static bool IsRelevantRegion(RegionResultDto r) =>
         r.Place is "region" or "state" or "county" or "district" or "suburb" or "city"
-        || ParseAdminLevel(r.AdminLevel) >= 4;
+        || TryParseAdminLevel(r.AdminLevel, out var lvl) && lvl >= 4;
 
-    private static int ParseAdminLevel(string? adminLevel) =>
+    private static bool TryParseAdminLevel(string? adminLevel, out int level) =>
+        int.TryParse(adminLevel, out level);
+
+    /// <summary>
+    /// Parses admin level; returns <see cref="int.MaxValue"/> for unparseable
+    /// values so they sort last.
+    /// </summary>
+    private static int ParseAdminLevelForSort(string? adminLevel) =>
         int.TryParse(adminLevel, out var level) ? level : int.MaxValue;
 }

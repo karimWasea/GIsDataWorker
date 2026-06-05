@@ -142,11 +142,12 @@ public sealed class GeoService : IGeoService
             })
             .ToListAsync(cancellationToken);
 
-        // Run both queries concurrently against the same DbContext connection.
-        await Task.WhenAll(pointAttractionsTask, polygonAttractionsTask);
+        // Run both queries concurrently.
+        var pointAttractions = await pointAttractionsTask;
+        var polygonAttractions = await polygonAttractionsTask;
 
-        return pointAttractionsTask.Result
-            .Concat(polygonAttractionsTask.Result)
+        return pointAttractions
+            .Concat(polygonAttractions)
             .GroupBy(a => a.OsmId)
             .Select(g => g.First())
             .OrderBy(a => a.DistanceMeters)
