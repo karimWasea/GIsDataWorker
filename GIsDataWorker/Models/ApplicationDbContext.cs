@@ -11,7 +11,7 @@ public partial class ApplicationDbContext : DbContext
     {
     }
 
-    public virtual DbSet<testmigration>  Testmigrations { get; set; }
+ 
     public virtual DbSet<osm2pgsql_property> osm2pgsql_properties { get; set; }
 
     public virtual DbSet<planet_osm_line> planet_osm_lines { get; set; }

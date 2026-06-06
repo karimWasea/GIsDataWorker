@@ -1041,22 +1041,6 @@ namespace GIsDataWorker.Migrations
                             t.ExcludeFromMigrations();
                         });
                 });
-
-            modelBuilder.Entity("GIsDataWorker.Models.testmigration", b =>
-                {
-                    b.Property<long?>("id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long?>("id"));
-
-                    b.Property<string>("access")
-                        .HasColumnType("text");
-
-                    b.HasKey("id");
-
-                    b.ToTable("Testmigrations");
-                });
 #pragma warning restore 612, 618
         }
     }

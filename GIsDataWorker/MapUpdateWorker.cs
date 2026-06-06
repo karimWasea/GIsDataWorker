@@ -1,3 +1,4 @@
+using GIsDataWorker;
 using GIsDataWorker.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -7,7 +8,9 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -15,20 +18,28 @@ using System.Threading.Tasks;
 
 public class MapUpdateWorker : BackgroundService
 {
+    // Removed the shared HTTP client instance and factory method
+
     private readonly ILogger<MapUpdateWorker> _logger;
     private readonly MapSettings _mapSettings;
     private readonly PostgresSettings _postgresSettings;
+    private readonly HttpClient _http;
+    private readonly OsmImportState _osmState;
     private string _osm2pgsqlPath = string.Empty;
     private string? _psqlPath;
 
     public MapUpdateWorker(
         ILogger<MapUpdateWorker> logger,
         IOptions<MapSettings> mapSettings,
-        IOptions<PostgresSettings> postgresSettings)
+        IOptions<PostgresSettings> postgresSettings,
+        IHttpClientFactory httpClientFactory,
+        OsmImportState osmState)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _mapSettings = mapSettings?.Value ?? throw new ArgumentNullException(nameof(mapSettings));
         _postgresSettings = postgresSettings?.Value ?? throw new ArgumentNullException(nameof(postgresSettings));
+        _http = httpClientFactory.CreateClient("GIsWorkerClient");
+        _osmState = osmState;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -42,36 +53,59 @@ public class MapUpdateWorker : BackgroundService
                 "PSQL_PATH environment variable to the full path of psql.exe.");
         _logger.LogInformation("psql found at: {Path}", _psqlPath);
 
-        try
+        // ── Retry loop for osm2pgsql install (network may be temporarily unavailable) ──
+        string osm2pgsqlFolder = _mapSettings.Osm2PgsqlFolder
+            ?? Path.Combine(AppContext.BaseDirectory, "tools");
+
+        while (!stoppingToken.IsCancellationRequested)
         {
-            string osm2pgsqlFolder = _mapSettings.Osm2PgsqlFolder
-                ?? Path.Combine(AppContext.BaseDirectory, "tools");
-            await EnsureOsm2PgSqlExists(osm2pgsqlFolder);
-            _logger.LogInformation("osm2pgsql is ready at: {Path}", _osm2pgsqlPath);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to initialize osm2pgsql. The worker cannot continue.");
-            throw;
+            try
+            {
+                await EnsureOsm2PgSqlExists(osm2pgsqlFolder);
+                _logger.LogInformation("osm2pgsql is ready at: {Path}", _osm2pgsqlPath);
+                break; // success — exit retry loop
+            }
+            catch (HttpRequestException ex) when (
+                ex.InnerException is System.Net.Sockets.SocketException)
+            {
+                _logger.LogWarning(
+                    "DNS/network error while downloading osm2pgsql. " +
+                    "Retrying in 2 minutes... ({Msg})", ex.Message);
+                await Task.Delay(TimeSpan.FromMinutes(2), stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize osm2pgsql. Retrying in 2 minutes...");
+                await Task.Delay(TimeSpan.FromMinutes(2), stoppingToken);
+            }
         }
 
+        if (stoppingToken.IsCancellationRequested) return;
+
+        // ── Main processing loop ──
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
                 bool dbExists = await IsDatabaseExists();
 
-                    if (!dbExists)
+                if (!dbExists)
+                {
+                    _logger.LogInformation("OSM data not imported. Running full import...");
+                    await RunFullImport();
+                }
+                else
+                {
+                    // ✅ Signal Worker that OSM tables are ready
+                    if (!_osmState.IsReady)
                     {
-                        _logger.LogInformation("Database exists but OSM data not imported. Running full import...");
-                        await RunFullImport();
+                        _logger.LogInformation("OSM data confirmed. Signaling Worker to start.");
+                        _osmState.SetReady();
                     }
-                    else
-                    {
-                        _logger.LogInformation("OSM data exists. Checking for updates...");
-                        await ApplyDiffUpdate();
-                    }
-                
+
+                    _logger.LogInformation("OSM data exists. Checking for updates...");
+                    await ApplyDiffUpdate();
+                }
             }
             catch (Exception ex)
             {
@@ -135,7 +169,7 @@ public class MapUpdateWorker : BackgroundService
         {
             // اختبار الاتصال بالخادم أولاً
             using var client = new HttpClient();
-            var response = await client.GetAsync(updatesUrl);
+            var response = await _http.GetAsync(updatesUrl);
             response.EnsureSuccessStatusCode();
 
             string diffUrl = await GetLatestUrl(updatesUrl, @"href=""([^""]+osc\.gz)""");
@@ -164,8 +198,7 @@ public class MapUpdateWorker : BackgroundService
     {
         _logger.LogInformation("Downloading {Url} → {Dest}", url, dest);
 
-        using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+    using var response = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
 
         long totalBytes = response.Content.Headers.ContentLength ?? -1L;
@@ -223,8 +256,7 @@ public class MapUpdateWorker : BackgroundService
     {
         try
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-            string html = await client.GetStringAsync(pageUrl);
+            string html = await _http.GetStringAsync(pageUrl);
             var matches = Regex.Matches(html, pattern);
             if (matches.Count == 0) return string.Empty;
             return new Uri(new Uri(pageUrl), matches[^1].Groups[1].Value).ToString();
@@ -304,61 +336,65 @@ public class MapUpdateWorker : BackgroundService
             ? $"--output=flex -S \"{stylePath}\""
             : $"-S \"{stylePath}\"";
 
- 
-
-    
-
     private async Task<bool> IsDatabaseExists()
     {
         try
         {
             string psql = _psqlPath!;
-
             string safeDbName = _postgresSettings.Database.Replace("'", "''");
 
-            // 1. check database exists
-            string existsArgs =
+            // Step 1: check the database itself exists
+            string dbExistsArgs =
                 $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
                 $"-p {_postgresSettings.Port} -d postgres -tAc " +
                 $"\"SELECT 1 FROM pg_database WHERE datname='{safeDbName}'\"";
 
-            string existsResult = await ExecuteCommand(psql, existsArgs, _postgresSettings.Password);
-            bool dbExists = existsResult.Trim() == "1";
-
-            if (!dbExists)
+            string dbResult = await ExecuteCommand(psql, dbExistsArgs, _postgresSettings.Password);
+            if (dbResult.Trim() != "1")
             {
                 _logger.LogInformation("Database '{DB}' does not exist.", _postgresSettings.Database);
                 return false;
             }
 
-            // 2. check planet_osm_point exists + has data
-            string dataArgs =
+            // Step 2: check if planet_osm_point TABLE exists (safe — no error if missing)
+            string tableExistsArgs =
+                $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
+                $"-p {_postgresSettings.Port} -d {_postgresSettings.Database} -tAc " +
+                "\"SELECT COUNT(*) FROM information_schema.tables " +
+                "WHERE table_schema='public' AND table_name='planet_osm_point'\"";
+
+            string tableResult = await ExecuteCommand(psql, tableExistsArgs, _postgresSettings.Password);
+            if (tableResult.Trim() != "1")
+            {
+                _logger.LogInformation(
+                    "Database '{DB}' exists but OSM tables not imported yet.",
+                    _postgresSettings.Database);
+                return false;
+            }
+
+            // Step 3: table exists — check it has data
+            string countArgs =
                 $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
                 $"-p {_postgresSettings.Port} -d {_postgresSettings.Database} -tAc " +
                 "\"SELECT COUNT(*) FROM planet_osm_point\"";
 
-            string dataResult = await ExecuteCommand(psql, dataArgs, _postgresSettings.Password);
-
-            if (!long.TryParse(dataResult.Trim(), out var count))
-                count = 0;
-
-            bool hasData = count > 0;
+            string countResult = await ExecuteCommand(psql, countArgs, _postgresSettings.Password);
+            bool hasData = long.TryParse(countResult.Trim(), out var rows) && rows > 0;
 
             _logger.LogInformation(
                 hasData
-                    ? "Database '{DB}' has planet_osm_point with data."
+                    ? "Database '{DB}' has OSM data ({Rows} rows in planet_osm_point)."
                     : "Database '{DB}' exists but planet_osm_point is empty.",
-                _postgresSettings.Database);
+                _postgresSettings.Database, rows);
 
             return hasData;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error checking database or planet_osm_point.");
+            _logger.LogError(ex, "Error checking database or OSM tables.");
             return false;
         }
     }
-     
     // ─────────────────────────────────────────────────────────────────────────
     //  Process runner
     // ─────────────────────────────────────────────────────────────────────────
@@ -440,8 +476,6 @@ public class MapUpdateWorker : BackgroundService
     private async Task EnsureOsm2PgSqlWindows(string targetFolder, string exeName)
     {
         string folder = Path.Combine(targetFolder, "osm2pgsql_bin");
-
-        // ✅ Fixed: was _settings.Osm2PgsqlUrl
         string downloadUrl = await ScrapeWindowsDownloadUrl();
 
         _logger.LogInformation("Downloading osm2pgsql from: {Url}", downloadUrl);
@@ -451,16 +485,16 @@ public class MapUpdateWorker : BackgroundService
 
         try
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
-            var response = await client.GetAsync(downloadUrl);
-            response.EnsureSuccessStatusCode();
-            await File.WriteAllBytesAsync(archivePath, await response.Content.ReadAsByteArrayAsync());
+            // ✅ uses _http internally + streams to disk (no RAM spike)
+            await DownloadFile(downloadUrl, archivePath);
 
+            _logger.LogInformation("Extracting osm2pgsql to: {Folder}", folder);
             ZipFile.ExtractToDirectory(archivePath, folder, overwriteFiles: true);
 
             _osm2pgsqlPath = Directory
                 .GetFiles(folder, exeName, SearchOption.AllDirectories)
-                .First();
+                .FirstOrDefault()
+                ?? throw new Exception($"osm2pgsql.exe not found after extraction in: {folder}");
 
             _logger.LogInformation("osm2pgsql installed at: {Path}", _osm2pgsqlPath);
         }

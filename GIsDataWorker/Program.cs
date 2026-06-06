@@ -1,8 +1,17 @@
 using GIsDataWorker;
 using GIsDataWorker.Models;
+using GIsDataWorker.Service;
+using GIsDataWorker.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting.WindowsServices;
+using System.Net;
+using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
+using System.Text;
+
+// ── Fix Arabic/Unicode characters showing as ???? in Windows console ──
+Console.OutputEncoding = Encoding.UTF8;
+Console.InputEncoding = Encoding.UTF8;
 
 var options = new HostApplicationBuilderSettings
 {
@@ -13,17 +22,37 @@ var options = new HostApplicationBuilderSettings
 };
 
 var builder = Host.CreateApplicationBuilder(options);
-// بعد builder.Services.AddDbContext
+builder.Services.AddHttpClient("GIsWorkerClient")
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        SslOptions = new System.Net.Security.SslClientAuthenticationOptions
+        {
+            EnabledSslProtocols =
+                System.Security.Authentication.SslProtocols.Tls12 |
+                System.Security.Authentication.SslProtocols.Tls13
+        },
+        ConnectTimeout = TimeSpan.FromSeconds(30),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Brotli,
+    })
+    .ConfigureHttpClient(client =>
+    {
+        client.Timeout = Timeout.InfiniteTimeSpan;
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "GIsDataWorker/1.0 (osm2pgsql-auto-install)");
+        client.DefaultRequestHeaders.Accept.Add(
+            new MediaTypeWithQualityHeaderValue("application/json"));
+    });
 builder.Services.Configure<MapSettings>(builder.Configuration.GetSection("MapSettings"));
 builder.Services.Configure<PostgresSettings>(builder.Configuration.GetSection("Postgres"));
+builder.Services.Configure<MongoSettings>(builder.Configuration.GetSection("MongoSettings"));
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
     .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true)
     .AddEnvironmentVariables();
 
- 
- 
+builder.Services.AddScoped<GeoService>();
 
 builder.Services.AddWindowsService(o =>
 {
@@ -35,13 +64,13 @@ builder.Services.AddDbContext<ApplicationDbContext>(dbOptions =>
         builder.Configuration.GetConnectionString("DefaultConnection"),
         x => x.UseNetTopologySuite()));
 
+builder.Services.AddSingleton<OsmImportState>();   // ← أضف قبل AddHostedService
 builder.Services.AddHostedService<Worker>();
 builder.Services.AddHostedService<MapUpdateWorker>();
- 
- 
+
 var host = builder.Build();
 
-// ── Auto-migrate on startup ✅
+// ── Auto-migrate on startup ──
 using (var scope = host.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
@@ -67,7 +96,5 @@ using (var scope = host.Services.CreateScope())
         throw;
     }
 }
-
-
 
 host.Run();
