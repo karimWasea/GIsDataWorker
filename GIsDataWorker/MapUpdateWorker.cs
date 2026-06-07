@@ -1,8 +1,10 @@
-using GIsDataWorker;
 using GIsDataWorker.Models;
+using GIsDataWorker.Utailites;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Npgsql;
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -15,6 +17,7 @@ using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+namespace GIsDataWorker;
 
 public class MapUpdateWorker : BackgroundService
 {
@@ -25,6 +28,7 @@ public class MapUpdateWorker : BackgroundService
     private readonly PostgresSettings _postgresSettings;
     private readonly HttpClient _http;
     private readonly OsmImportState _osmState;
+    private readonly IServiceScopeFactory _scopeFactory;
     private string _osm2pgsqlPath = string.Empty;
     private string? _psqlPath;
 
@@ -33,13 +37,15 @@ public class MapUpdateWorker : BackgroundService
         IOptions<MapSettings> mapSettings,
         IOptions<PostgresSettings> postgresSettings,
         IHttpClientFactory httpClientFactory,
-        OsmImportState osmState)
+        OsmImportState osmState,
+        IServiceScopeFactory scopeFactory)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _mapSettings = mapSettings?.Value ?? throw new ArgumentNullException(nameof(mapSettings));
         _postgresSettings = postgresSettings?.Value ?? throw new ArgumentNullException(nameof(postgresSettings));
         _http = httpClientFactory.CreateClient("GIsWorkerClient");
         _osmState = osmState;
+        _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -168,7 +174,6 @@ public class MapUpdateWorker : BackgroundService
         try
         {
             // اختبار الاتصال بالخادم أولاً
-            using var client = new HttpClient();
             var response = await _http.GetAsync(updatesUrl);
             response.EnsureSuccessStatusCode();
 
@@ -340,31 +345,21 @@ public class MapUpdateWorker : BackgroundService
     {
         try
         {
-            string psql = _psqlPath!;
-            string safeDbName = _postgresSettings.Database.Replace("'", "''");
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
-            // Step 1: check the database itself exists
-            string dbExistsArgs =
-                $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
-                $"-p {_postgresSettings.Port} -d postgres -tAc " +
-                $"\"SELECT 1 FROM pg_database WHERE datname='{safeDbName}'\"";
+            // Reuse the same EF Core connection — guaranteed to have the correct credentials.
+            await db.Database.OpenConnectionAsync();   // same credentials that EF Core uses
+            var conn = db.Database.GetDbConnection();  // NpgsqlConnection, already authenticated
 
-            string dbResult = await ExecuteCommand(psql, dbExistsArgs, _postgresSettings.Password);
-            if (dbResult.Trim() != "1")
-            {
-                _logger.LogInformation("Database '{DB}' does not exist.", _postgresSettings.Database);
-                return false;
-            }
+            // Step 1: does planet_osm_point table exist?
+            await using var tableCheckCmd = conn.CreateCommand();
+            tableCheckCmd.CommandText =
+                "SELECT 1 FROM information_schema.tables " +
+                "WHERE table_schema = 'public' AND table_name = 'planet_osm_point'";
+            var tableExists = await tableCheckCmd.ExecuteScalarAsync() is not null;
 
-            // Step 2: check if planet_osm_point TABLE exists (safe — no error if missing)
-            string tableExistsArgs =
-                $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
-                $"-p {_postgresSettings.Port} -d {_postgresSettings.Database} -tAc " +
-                "\"SELECT COUNT(*) FROM information_schema.tables " +
-                "WHERE table_schema='public' AND table_name='planet_osm_point'\"";
-
-            string tableResult = await ExecuteCommand(psql, tableExistsArgs, _postgresSettings.Password);
-            if (tableResult.Trim() != "1")
+            if (!tableExists)
             {
                 _logger.LogInformation(
                     "Database '{DB}' exists but OSM tables not imported yet.",
@@ -372,20 +367,16 @@ public class MapUpdateWorker : BackgroundService
                 return false;
             }
 
-            // Step 3: table exists — check it has data
-            string countArgs =
-                $"-U {_postgresSettings.Username} -h {_postgresSettings.Host} " +
-                $"-p {_postgresSettings.Port} -d {_postgresSettings.Database} -tAc " +
-                "\"SELECT COUNT(*) FROM planet_osm_point\"";
-
-            string countResult = await ExecuteCommand(psql, countArgs, _postgresSettings.Password);
-            bool hasData = long.TryParse(countResult.Trim(), out var rows) && rows > 0;
+            // Step 2: does the table have at least one row? (LIMIT 1 — never a full table scan)
+            await using var rowCheckCmd = conn.CreateCommand();
+            rowCheckCmd.CommandText = "SELECT 1 FROM planet_osm_point LIMIT 1";
+            var hasData = await rowCheckCmd.ExecuteScalarAsync() is not null;
 
             _logger.LogInformation(
                 hasData
-                    ? "Database '{DB}' has OSM data ({Rows} rows in planet_osm_point)."
+                    ? "Database '{DB}' has OSM data (planet_osm_point is populated)."
                     : "Database '{DB}' exists but planet_osm_point is empty.",
-                _postgresSettings.Database, rows);
+                _postgresSettings.Database);
 
             return hasData;
         }
@@ -414,7 +405,9 @@ public class MapUpdateWorker : BackgroundService
         };
 
         process.StartInfo.EnvironmentVariables["PGPASSWORD"] = pgPassword;
-        process.Start();
+
+        if (!process.Start())
+            throw new InvalidOperationException($"Failed to start process: {fileName}");
 
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();

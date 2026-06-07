@@ -1,4 +1,4 @@
-namespace GIsDataWorker;
+namespace GIsDataWorker.Utailites;
 
 /// <summary>
 /// Shared singleton signal — MapUpdateWorker sets it ready,

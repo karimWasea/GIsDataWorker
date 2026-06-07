@@ -1,5 +1,8 @@
+using GIsDataWorker.DTos;
 using GIsDataWorker.Models;
+using GIsDataWorker.Service;
 using GIsDataWorker.Services;
+using GIsDataWorker.Utailites;
 
 namespace GIsDataWorker
 {
@@ -7,18 +10,18 @@ namespace GIsDataWorker
     {
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly ILogger<Worker> _logger;
+        private readonly IMongoLocationService _mongoLocationService;
         private readonly OsmImportState _osmState;
 
-        private readonly List<(double Latitude, double Longitude)> _coordinates = new()
-        {
-            (30.05041, 31.23214),
-            (30.06762, 31.22259)
-        };
-
-        public Worker(IServiceScopeFactory scopeFactory, ILogger<Worker> logger, OsmImportState osmState)
+        public Worker(
+            IServiceScopeFactory scopeFactory,
+            ILogger<Worker> logger,
+            IMongoLocationService mongoLocationService,
+            OsmImportState osmState)
         {
             _scopeFactory = scopeFactory;
             _logger = logger;
+            _mongoLocationService = mongoLocationService;
             _osmState = osmState;
         }
 
@@ -37,109 +40,128 @@ namespace GIsDataWorker
             {
                 try
                 {
-                    // ── Regions ──────────────────────────────────────────────────
-                    var regionTasks = _coordinates
-                        .Select(async c =>
-                        {
-                            using var scope = _scopeFactory.CreateScope();
-                            var geoService = scope.ServiceProvider.GetRequiredService<GeoService>();
-
-                            var regions = await geoService.GetRegionByCoordinatesAsync(c.Latitude, c.Longitude);
-
-                            var areaRegions = regions
-      .Where(r =>
-          r.Place == "region" ||
-          r.Place == "state" ||
-          r.Place == "county" ||
-          r.Place == "district" ||
-          r.Place == "suburb" ||
-          r.Place == "city" ||
-          (int.TryParse(r.AdminLevel, out var lvl) && lvl >= 4))  // ✅ parse string → int
-      .OrderBy(r => int.TryParse(r.AdminLevel, out var lvl) ? lvl : int.MaxValue)  // ✅ sort correctly
-      .ToList();
-
-                            return (regions: areaRegions, coord: c);
-                        });
-
-                    var allRegions = await Task.WhenAll(regionTasks);
-
-                    foreach (var result in allRegions)
+                    var parallelOptions = new ParallelOptions
                     {
-                        var regions = result.regions;
-                        var coord = result.coord;
+                        // Number of documents to process at the same time.
+                        // Start with a number like 10 and tune it based on your CPU and DB performance.
+                        MaxDegreeOfParallelism = 10,
+                        CancellationToken = stoppingToken
+                    };
 
-                        if (regions.Any())
+                    var processedCount = 0;
+                    //var locations = new List<MongoLocationDto>();
+                    //await foreach (var location in _mongoLocationService.GetLocationsAsync(stoppingToken))
+                    //{
+                    //    if (locations.Count >= 10) break;
+                    //    locations.Add(location);
+                    //}
+                    await Parallel.ForEachAsync(
+                        _mongoLocationService.GetLocationsAsync(stoppingToken),
+                        parallelOptions,
+                        async (location, token) =>
                         {
-                            // ✅ Most specific area by highest AdminLevel
-                            var specific = regions
-                                .Where(r => int.TryParse(r.AdminLevel, out _))
-                                .OrderByDescending(r => int.Parse(r.AdminLevel!))
-                                .FirstOrDefault()
-                                ?? regions.First();
-
-                            // ✅ Suburb specifically
-                            var suburb = regions.FirstOrDefault(r => r.Place == "suburb");
-
-                            _logger.LogInformation(
-                                "Location [lat={lat}, lng={lng}] => " +
-                                "Area: {name} | AdminLevel: {level} | Place: {place} | " +
-                                "Suburb: {suburb} | OsmId: {id}",
-                                coord.Latitude, coord.Longitude,
-                                specific.Name,
-                                specific.AdminLevel,
-                                specific.Place,
-                                suburb?.Name ?? "N/A",    // ✅ suburb name or N/A
-                                specific.OsmId);
-
-                            // ✅ Also log all matched regions for full visibility
-                            foreach (var region in regions)
-                            {
-                                _logger.LogDebug(
-                                    "  └─ [lat={lat}, lng={lng}] Name: {name} | AdminLevel: {level} | Place: {place} | Suburb: {suburb}",
-                                    coord.Latitude, coord.Longitude,
-                                    region.Name, region.AdminLevel, region.Place,
-                                    region.Suburb ?? "-");
-                            }
-                        }
-                        else
-                        {
-                            _logger.LogWarning(
-                                "No region/area found for lat={lat}, lng={lng}.",
-                                coord.Latitude, coord.Longitude);
-                        }
-                    }
-
-                     //  ── Nearby Attractions(uncomment to enable) ─────────────────
-                        var attractionTasks = _coordinates
-                            .Select(async c =>
+                            try
                             {
                                 using var scope = _scopeFactory.CreateScope();
-                                var geoService = scope.ServiceProvider.GetRequiredService<GeoService>();
-                                var attractions = await geoService.GetNearbyAttractionsAsync(c.Latitude, c.Longitude, radiusMeters: 1500, maxResults: 100);
-                                return (attractions, coord: c);
-                            });
+                                var geoService = scope.ServiceProvider.GetRequiredService<IGeoService>();
 
-                    var allAttractions = await Task.WhenAll(attractionTasks);
+                                // ─── Regions ───────────────────────────────────────────────
+                                var regions = await geoService.GetRegionByCoordinatesAsync(
+                                    location.Latitude, location.Longitude);
 
-                    foreach (var (attractions, coord) in allAttractions)
-                    {
-                        if (attractions.Any())
-                            foreach (var attraction in attractions)
-                                _logger.LogInformation(
-                                    "Attraction [lat={lat},lng={lng}] => Name: {name} | Type: {type} | Distance: {dist:F0}m",
-                                    coord.Latitude, coord.Longitude,
-                                    attraction.Name,
-                                    attraction.Amenity ?? attraction.Tourism ?? attraction.Leisure ?? attraction.Shop ?? attraction.HistoricTag ?? "unknown",
-                                    attraction.DistanceMeters);
-                        else
-                            _logger.LogWarning("No attractions found for lat={lat}, lng={lng}.",
-                                coord.Latitude, coord.Longitude);
-                    }
+                                var areaRegions = regions
+                                    .Where(r =>
+                                        r.Place == "region"   ||
+                                        r.Place == "state"    ||
+                                        r.Place == "county"   ||
+                                        r.Place == "district" ||
+                                        r.Place == "suburb"   ||
+                                        r.Place == "city"     ||
+                                        (int.TryParse(r.AdminLevel, out var lvl) && lvl >= 4))
+                                    .OrderBy(r => int.TryParse(r.AdminLevel, out var lvl) ? lvl : int.MaxValue)
+                                    .ToList();
+
+                                if (areaRegions.Count > 0)
+                                {
+                                    var specific = areaRegions
+                                        .Where(r => int.TryParse(r.AdminLevel, out _))
+                                        .OrderByDescending(r => int.Parse(r.AdminLevel!))
+                                        .FirstOrDefault()
+                                        ?? areaRegions.First();
+
+                                    var suburb = areaRegions.FirstOrDefault(r => r.Place == "suburb");
+
+                                    _logger.LogInformation(
+                                        "Mongo {collection} location {sourceId} ({name}) [lat={lat}, lng={lng}] => " +
+                                        "Area: {area} | AdminLevel: {level} | Place: {place} | Suburb: {suburb} | OsmId: {id}",
+                                        location.CollectionName, location.Id, location.Name ?? "N/A",
+                                        location.Latitude, location.Longitude,
+                                        specific.Name, specific.AdminLevel, specific.Place,
+                                        suburb?.Name ?? "N/A", specific.OsmId);
+
+                                    foreach (var region in areaRegions)
+                                    {
+                                        _logger.LogDebug(
+                                            "  └─ Mongo {collection} location {sourceId} [lat={lat}, lng={lng}] " +
+                                            "Name: {name} | AdminLevel: {level} | Place: {place} | Suburb: {suburb}",
+                                            location.CollectionName, location.Id,
+                                            location.Latitude, location.Longitude,
+                                            region.Name, region.AdminLevel, region.Place, region.Suburb ?? "-");
+                                    }
+                                }
+                                else
+                                {
+                                    _logger.LogWarning(
+                                        "No region/area found for Mongo {collection} location {sourceId} ({name}) at lat={lat}, lng={lng}.",
+                                        location.CollectionName, location.Id, location.Name ?? "N/A",
+                                        location.Latitude, location.Longitude);
+                                }
+
+                                // ─── Attractions ───────────────────────────────────────────
+                                var attractions = await geoService.GetNearbyAttractionsAsync(
+                                    location.Latitude, location.Longitude, radiusMeters: 1500, maxResults: 100);
+
+                                if (attractions.Count > 0)
+                                {
+                                    foreach (var attraction in attractions)
+                                    {
+                                        _logger.LogInformation(
+                                            "Attraction for Mongo {collection} location {sourceId} ({name}) [lat={lat},lng={lng}] => " +
+                                            "Name: {attractionName} | Type: {type} | Distance: {dist:F0}m",
+                                            location.CollectionName, location.Id, location.Name ?? "N/A",
+                                            location.Latitude, location.Longitude,
+                                            attraction.Name,
+                                            attraction.Amenity ?? attraction.Tourism ?? attraction.Leisure
+                                                ?? attraction.Shop ?? attraction.HistoricTag ?? "unknown",
+                                            attraction.DistanceMeters);
+                                    }
+                                }
+                                else
+                                {
+                                    _logger.LogWarning(
+                                        "No attractions found for Mongo {collection} location {sourceId} ({name}) at lat={lat}, lng={lng}.",
+                                        location.CollectionName, location.Id, location.Name ?? "N/A",
+                                        location.Latitude, location.Longitude);
+                                }
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            {
+                                _logger.LogError(ex,
+                                    "Error processing Mongo {collection} location {sourceId} ({name}).",
+                                    location.CollectionName, location.Id, location.Name ?? "N/A");
+                            }
+                        });
+
+                    _logger.LogInformation("Finished processing {Count} MongoDB location(s).", processedCount);
                 }
-                    catch (Exception ex)
+                catch (OperationCanceledException)
                 {
-                    _logger.LogError(ex, "GIS Worker encountered an error.");
-                    }
+                    _logger.LogInformation("Parallel processing was cancelled.");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "GIS Worker encountered an error during parallel processing.");
+                }
 
                 await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);
             }

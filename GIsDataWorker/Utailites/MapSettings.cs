@@ -1,4 +1,4 @@
-﻿namespace GIsDataWorker.Models;
+﻿namespace GIsDataWorker.Utailites;
 
  
 
@@ -7,6 +7,10 @@ public class MongoSettings
 {
     public string Mongo { get; set; } = string.Empty;
     public string MongoDB { get; set; } = string.Empty;
+    public string Collection { get; set; } = "bedzinn";
+    public List<string> Collections { get; set; } = [];
+    public string[] LatitudeFieldNames { get; set; } = ["Latitude", "latitude", "Lat", "lat"];
+    public string[] LongitudeFieldNames { get; set; } = ["Longitude", "longitude", "Lng", "lng", "Long", "long"];
 }
  
     public class MapSettings

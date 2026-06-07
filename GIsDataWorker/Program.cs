@@ -2,6 +2,7 @@ using GIsDataWorker;
 using GIsDataWorker.Models;
 using GIsDataWorker.Service;
 using GIsDataWorker.Services;
+using GIsDataWorker.Utailites;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using System.Net;
@@ -44,7 +45,6 @@ builder.Services.AddHttpClient("GIsWorkerClient")
             new MediaTypeWithQualityHeaderValue("application/json"));
     });
 builder.Services.Configure<MapSettings>(builder.Configuration.GetSection("MapSettings"));
-builder.Services.Configure<PostgresSettings>(builder.Configuration.GetSection("Postgres"));
 builder.Services.Configure<MongoSettings>(builder.Configuration.GetSection("MongoSettings"));
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
@@ -52,7 +52,8 @@ builder.Configuration
     .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true)
     .AddEnvironmentVariables();
 
-builder.Services.AddScoped<GeoService>();
+builder.Services.AddScoped<IGeoService, GeoService>();
+builder.Services.AddSingleton<IMongoLocationService, MongoLocationService>();
 
 builder.Services.AddWindowsService(o =>
 {
@@ -97,4 +98,4 @@ using (var scope = host.Services.CreateScope())
     }
 }
 
-host.Run();
+host.Run(); 
