@@ -102,8 +102,8 @@ public class MongoLocationService : IMongoLocationService
             throw new InvalidOperationException("MongoSettings:Collections is empty or missing. Please configure collection names in appsettings.json.");
         }
 
-        _latitudeFieldNames = settings.LatitudeFieldNames ?? ["Latitude", "latitude", "Lat", "lat"];
-        _longitudeFieldNames = settings.LongitudeFieldNames ?? ["Longitude", "longitude", "Lng", "lng", "Long", "long"];
+        _latitudeFieldNames = settings.LatitudeFieldNames !;
+        _longitudeFieldNames = settings.LongitudeFieldNames!;
 
         _database = new MongoClient(settings.Mongo).GetDatabase(settings.MongoDB);
     }

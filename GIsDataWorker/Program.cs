@@ -46,6 +46,7 @@ builder.Services.AddHttpClient("GIsWorkerClient")
     });
 builder.Services.Configure<MapSettings>(builder.Configuration.GetSection("MapSettings"));
 builder.Services.Configure<MongoSettings>(builder.Configuration.GetSection("MongoSettings"));
+builder.Services.Configure<PostgresSettings>(builder.Configuration.GetSection("Postgres"));
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)

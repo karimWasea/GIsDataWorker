@@ -121,7 +121,7 @@ namespace GIsDataWorker
                                 var attractions = await geoService.GetNearbyAttractionsAsync(
                                     location.Latitude, location.Longitude, radiusMeters: 1500, maxResults: 100);
 
-                                if (attractions.Count > 0)
+                               if (attractions.Count > 0)
                                 {
                                     foreach (var attraction in attractions)
                                     {
