@@ -9,7 +9,7 @@ namespace GIsDataWorker.Service {
 
     public interface IGeoService
     {
-        Task<List<RegionResultDtoDto>> GetRegionByCoordinatesAsync(double latitude, double longitude);
+        Task<RegionResultDto?> GetRegionByCoordinatesAsync(double latitude, double longitude, CancellationToken ct = default);
        Task<List<AttractionResultDto>> GetNearbyAttractionsAsync(
                    double latitude,
                    double longitude,

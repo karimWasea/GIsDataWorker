@@ -29,7 +29,6 @@ namespace GIsDataWorker
         {
             _logger.LogInformation("GIS Worker waiting for OSM data to be ready...");
 
-            // ✅ Wait until MapUpdateWorker confirms OSM import is done
             await Task.WhenAny(_osmState.OsmDataReady, Task.Delay(Timeout.Infinite, stoppingToken));
 
             if (stoppingToken.IsCancellationRequested) return;
@@ -40,21 +39,15 @@ namespace GIsDataWorker
             {
                 try
                 {
+                    var processedCount = 0;
+                    var errorCount = 0;
+
                     var parallelOptions = new ParallelOptions
                     {
-                        // Number of documents to process at the same time.
-                        // Start with a number like 10 and tune it based on your CPU and DB performance.
-                        MaxDegreeOfParallelism = 10,
+                        MaxDegreeOfParallelism = 10,  // tune based on DB performance
                         CancellationToken = stoppingToken
                     };
 
-                    var processedCount = 0;
-                    //var locations = new List<MongoLocationDto>();
-                    //await foreach (var location in _mongoLocationService.GetLocationsAsync(stoppingToken))
-                    //{
-                    //    if (locations.Count >= 10) break;
-                    //    locations.Add(location);
-                    //}
                     await Parallel.ForEachAsync(
                         _mongoLocationService.GetLocationsAsync(stoppingToken),
                         parallelOptions,
@@ -62,105 +55,96 @@ namespace GIsDataWorker
                         {
                             try
                             {
+                                // Each task gets its own scope + DbContext
+                                // REQUIRED — DbContext is NOT thread-safe
                                 using var scope = _scopeFactory.CreateScope();
-                                var geoService = scope.ServiceProvider.GetRequiredService<IGeoService>();
+                                var geoService = scope.ServiceProvider
+                                                           .GetRequiredService<IGeoService>();
 
-                                // ─── Regions ───────────────────────────────────────────────
-                                var regions = await geoService.GetRegionByCoordinatesAsync(
+                                // ─── 1. Region ──────────────────────────────────────────
+                                var region = await geoService.GetRegionByCoordinatesAsync(
                                     location.Latitude, location.Longitude);
 
-                                var areaRegions = regions
-                                    .Where(r =>
-                                        r.Place == "region"   ||
-                                        r.Place == "state"    ||
-                                        r.Place == "county"   ||
-                                        r.Place == "district" ||
-                                        r.Place == "suburb"   ||
-                                        r.Place == "city"     ||
-                                        (int.TryParse(r.AdminLevel, out var lvl) && lvl >= 4))
-                                    .OrderBy(r => int.TryParse(r.AdminLevel, out var lvl) ? lvl : int.MaxValue)
-                                    .ToList();
-
-                                if (areaRegions.Count > 0)
+                                if (region is not null)
                                 {
-                                    var specific = areaRegions
-                                        .Where(r => int.TryParse(r.AdminLevel, out _))
-                                        .OrderByDescending(r => int.Parse(r.AdminLevel!))
-                                        .FirstOrDefault()
-                                        ?? areaRegions.First();
-
-                                    var suburb = areaRegions.FirstOrDefault(r => r.Place == "suburb");
-
                                     _logger.LogInformation(
-                                        "Mongo {collection} location {sourceId} ({name}) [lat={lat}, lng={lng}] => " +
-                                        "Area: {area} | AdminLevel: {level} | Place: {place} | Suburb: {suburb} | OsmId: {id}",
+                                        "[Region] {collection}/{sourceId} ({name}) " +
+                                        "[{lat},{lng}] => {regionName} | " +
+                                        "AdminLevel: {level} | Place: {place} | OsmId: {osmId}",
                                         location.CollectionName, location.Id, location.Name ?? "N/A",
                                         location.Latitude, location.Longitude,
-                                        specific.Name, specific.AdminLevel, specific.Place,
-                                        suburb?.Name ?? "N/A", specific.OsmId);
-
-                                    foreach (var region in areaRegions)
-                                    {
-                                        _logger.LogDebug(
-                                            "  └─ Mongo {collection} location {sourceId} [lat={lat}, lng={lng}] " +
-                                            "Name: {name} | AdminLevel: {level} | Place: {place} | Suburb: {suburb}",
-                                            location.CollectionName, location.Id,
-                                            location.Latitude, location.Longitude,
-                                            region.Name, region.AdminLevel, region.Place, region.Suburb ?? "-");
-                                    }
+                                        region.Name, region.AdminLevel,
+                                        region.Place, region.OsmId);
                                 }
                                 else
                                 {
                                     _logger.LogWarning(
-                                        "No region/area found for Mongo {collection} location {sourceId} ({name}) at lat={lat}, lng={lng}.",
+                                        "[Region] No region found for {collection}/{sourceId} " +
+                                        "({name}) at [{lat},{lng}].",
                                         location.CollectionName, location.Id, location.Name ?? "N/A",
                                         location.Latitude, location.Longitude);
                                 }
 
-                                // ─── Attractions ───────────────────────────────────────────
+                                // ─── 2. Attractions ─────────────────────────────────────
                                 var attractions = await geoService.GetNearbyAttractionsAsync(
-                                    location.Latitude, location.Longitude, radiusMeters: 1500, maxResults: 100);
+                                    location.Latitude, location.Longitude,
+                                    radiusMeters: 1500,
+                                    maxResults: 100);
 
-                               if (attractions.Count > 0)
+                                if (attractions.Count > 0)
                                 {
                                     foreach (var attraction in attractions)
                                     {
                                         _logger.LogInformation(
-                                            "Attraction for Mongo {collection} location {sourceId} ({name}) [lat={lat},lng={lng}] => " +
-                                            "Name: {attractionName} | Type: {type} | Distance: {dist:F0}m",
+                                            "[Attraction] {collection}/{sourceId} ({name}) " +
+                                            "[{lat},{lng}] => {attractionName} | " +
+                                            "Type: {type} | Distance: {dist:F0}m",
                                             location.CollectionName, location.Id, location.Name ?? "N/A",
                                             location.Latitude, location.Longitude,
                                             attraction.Name,
-                                            attraction.Amenity ?? attraction.Tourism ?? attraction.Leisure
-                                                ?? attraction.Shop ?? attraction.HistoricTag ?? "unknown",
+                                            attraction.Amenity ?? attraction.Tourism ??
+                                            attraction.Leisure ?? attraction.Shop ??
+                                            attraction.HistoricTag ?? "unknown",
                                             attraction.DistanceMeters);
                                     }
                                 }
                                 else
                                 {
                                     _logger.LogWarning(
-                                        "No attractions found for Mongo {collection} location {sourceId} ({name}) at lat={lat}, lng={lng}.",
+                                        "[Attraction] None found for {collection}/{sourceId} " +
+                                        "({name}) at [{lat},{lng}].",
                                         location.CollectionName, location.Id, location.Name ?? "N/A",
                                         location.Latitude, location.Longitude);
                                 }
+
+                                // ─── Thread-safe counter ─────────────────────────────────
+                                Interlocked.Increment(ref processedCount);
                             }
-                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            catch (OperationCanceledException)
                             {
+                                throw; // let Parallel.ForEachAsync stop cleanly
+                            }
+                            catch (Exception ex)
+                            {
+                                Interlocked.Increment(ref errorCount);
                                 _logger.LogError(ex,
-                                    "Error processing Mongo {collection} location {sourceId} ({name}).",
+                                    "[Error] Failed processing {collection}/{sourceId} ({name}).",
                                     location.CollectionName, location.Id, location.Name ?? "N/A");
                             }
                         });
 
-                    _logger.LogInformation("Finished processing {Count} MongoDB location(s).", processedCount);
+                    _logger.LogInformation(
+                        "Batch complete — processed: {processed}, errors: {errors}.",
+                        processedCount, errorCount);
                 }
                 catch (OperationCanceledException)
                 {
-                    _logger.LogInformation("Parallel processing was cancelled.");
+                    _logger.LogInformation("GIS Worker cancelled — shutting down.");
+                    break;
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "GIS Worker encountered an error during parallel processing.");
+                    _logger.LogError(ex, "GIS Worker batch failed.");
                 }
 
                 await Task.Delay(TimeSpan.FromSeconds(60), stoppingToken);

@@ -1,4 +1,5 @@
-﻿using GIsDataWorker.DTos;
+﻿using Amazon.Runtime.Internal.Util;
+using GIsDataWorker.DTos;
 using GIsDataWorker.Models;
 using GIsDataWorker.Service;
 using Microsoft.EntityFrameworkCore;
@@ -69,36 +70,54 @@ namespace GIsDataWorker.Services
         /// valid Egypt admin levels: 2=Country, 4=Governorate, 6=District, 8=Sub-district.
         /// Results are ordered most-specific first (8 → 6 → 4 → 2).
         /// </summary>
-        public async Task<List<RegionResultDtoDto>> GetRegionByCoordinatesAsync(
-            double latitude,
-            double longitude)
+        // GeoService.cs — replaces GetRegionByCoordinatesAsync
+
+        public async Task<RegionResultDto?> GetRegionByCoordinatesAsync(double latitude, double longitude, CancellationToken ct = default)
         {
-            var point = ToWebMercator(latitude, longitude);
+            try
+            {
+                var point = ToWebMercator(latitude, longitude);
 
-            return await _db.planet_osm_polygons
-                .AsNoTracking()
-                .Where(p =>
-                    p.way      != null                         &&
-                    p.name     != null                         &&
-                    p.boundary == "administrative"             &&
-                    p.admin_level != null                      &&
-                    _validAdminLevels.Contains(p.admin_level) &&
-                    p.way.Contains(point))
-                // "2","4","6","8" are single-digit strings — lexicographic descending is correct
-                .OrderByDescending(p => p.admin_level)
-                .Select(p => new RegionResultDtoDto
+                // جلب كل المضلعات المتداخلة مع النقطة
+                var regions = await _db.planet_osm_polygons
+                    .AsNoTracking()
+                    .Where(p => p.way != null && p.way.Contains(point))
+                    .Select(p => new
+                    {
+                        p.name,
+                        p.admin_level,
+                        p.boundary,
+                        p.place,
+                        p.osm_id,
+                        Area = p.way.Area
+                    })
+                    .ToListAsync(ct);
+
+                if (!regions.Any()) return null;
+
+                // ترتيب المضلعات برمجياً (الأصغر مساحة أو الأعلى admin_level أولاً)
+                var sorted = regions.OrderBy(r => r.Area).ToList();
+
+                var finest = sorted.FirstOrDefault();
+
+                // بناء النتيجة بناءً على المستويات الإدارية المعروفة
+                return new RegionResultDto
                 {
-                    Name       = p.name,
-                    AdminLevel = p.admin_level,
-                    Boundary   = p.boundary,
-                    Place      = p.place,
-                    OsmId      = p.osm_id.ToString(),
-                    Suburb     = p.admin_level == "8" ? p.name : null
-                })
-                .Take(5)   // max 4 levels (2,4,6,8) + 1 safety margin
-                .ToListAsync();
-        }
+                    Name = finest?.name,
+                    AdminLevel = finest?.admin_level,
+                    Boundary = finest?.boundary,
+                    Place = finest?.place,
+                    OsmId = finest?.osm_id.ToString(),
 
+                    // استخراج الهيكل الإداري من القائمة التي جلبناها
+                    Governorate = sorted.FirstOrDefault(r => r.admin_level == "4")?.name,
+                    District = sorted.FirstOrDefault(r => r.admin_level == "6")?.name,
+                    City = sorted.FirstOrDefault(r => r.admin_level == "8")?.name ??
+                           sorted.FirstOrDefault(r => r.place == "city" || r.place == "town")?.name
+                };
+            }
+            catch (Exception) { return null; }
+        }
         // ── FUNCTION 2: Nearby attractions ─────────────────────────────────────
 
         /// <summary>
