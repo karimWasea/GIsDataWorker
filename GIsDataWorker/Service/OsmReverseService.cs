@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using GIsDataWorker.DTos;
 using GIsDataWorker.Models;
+using GIsDataWorker.Utailites;
 using Microsoft.EntityFrameworkCore;
 using NetTopologySuite.Geometries;
 
@@ -499,10 +500,7 @@ public sealed class OsmReverseService : IOsmReverseService
         return 2 * R * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
     }
 
-    private enum Src { Node, Way, Rel }
-    private sealed record PlaceCand(string Place, string? Name, long OsmId, Src Src,
-        double DistanceM, double Lat, double Lon);
-    private sealed record AdminCand(int Level, string? Name, long OsmId, double X, double Y);
+
 
     
 }
