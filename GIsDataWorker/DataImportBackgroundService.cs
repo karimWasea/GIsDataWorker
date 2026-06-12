@@ -1,4 +1,5 @@
 using GIsDataWorker.Models;
+using GIsDataWorker.Services;
 using GIsDataWorker.Utailites;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
@@ -19,11 +20,11 @@ using System.Threading;
 using System.Threading.Tasks;
 namespace GIsDataWorker;
 
-public class MapUpdateWorker : BackgroundService
-{
+public class DataImportBackgroundService : BackgroundService
+ {
     // Removed the shared HTTP client instance and factory method
 
-    private readonly ILogger<MapUpdateWorker> _logger;
+    private readonly ILogger<DataImportBackgroundService> _logger;
     private readonly MapSettings _mapSettings;
     private readonly PostgresSettings _postgresSettings;
     private readonly HttpClient _http;
@@ -32,8 +33,8 @@ public class MapUpdateWorker : BackgroundService
     private string _osm2pgsqlPath = string.Empty;
     private string? _psqlPath;
 
-    public MapUpdateWorker(
-        ILogger<MapUpdateWorker> logger,
+    public DataImportBackgroundService(
+        ILogger<DataImportBackgroundService> logger,
         IOptions<MapSettings> mapSettings,
         IOptions<PostgresSettings> postgresSettings,
         IHttpClientFactory httpClientFactory,
@@ -99,6 +100,16 @@ public class MapUpdateWorker : BackgroundService
                 {
                     _logger.LogInformation("OSM data not imported. Running full import...");
                     await RunFullImport();
+                    if (!dbExists)
+                    {
+                        _logger.LogInformation("OSM data not imported. Running full import...");
+                        await RunFullImport(); // سيقوم بـ osm2pgsql
+
+                        // الترتيب الصحيح: لا يتم تنفيذ هذا السطر إلا بعد نجاح Import
+                        await EnsureIndexesCreatedAsync();
+                        _logger.LogInformation("OSM  EnsureIndexesCreatedAsync  done");
+
+                    }
                 }
                 else
                 {
@@ -703,5 +714,41 @@ var searchRoots = new[]
             .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
             .Select(dir => Path.Combine(dir, exeName))
             .FirstOrDefault(File.Exists);
+    }
+    public async Task EnsureIndexesCreatedAsync()
+    {
+        _logger.LogInformation("Applying OSM Performance Indexes...");
+
+        var commands = new[]
+        {
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_polygon_admin_way ON planet_osm_polygon USING gist (way) WHERE boundary = 'administrative' AND admin_level IS NOT NULL AND name IS NOT NULL;",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_polygon_admin_level ON planet_osm_polygon (admin_level) WHERE boundary = 'administrative';",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_point_attraction_way ON planet_osm_point USING gist (way) WHERE name IS NOT NULL AND (tourism IS NOT NULL OR historic IS NOT NULL OR leisure IS NOT NULL);",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_polygon_attraction_way ON planet_osm_polygon USING gist (way) WHERE name IS NOT NULL AND (tourism IS NOT NULL OR historic IS NOT NULL OR leisure IS NOT NULL);",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_point_place_way ON planet_osm_point USING gist (way) WHERE place IS NOT NULL AND name IS NOT NULL;"
+    };
+
+        // استخدام Scope للحصول على الـ DbContext واستخراج الـ Connection String منه
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        var connectionString = db.Database.GetConnectionString();
+
+        using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+
+        foreach (var sql in commands)
+        {
+            try
+            {
+                await using var cmd = new NpgsqlCommand(sql, conn);
+                cmd.CommandTimeout = 600; // 10 دقائق
+                await cmd.ExecuteNonQueryAsync();
+                _logger.LogInformation("Successfully applied index.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error applying index: {Sql}", sql);
+            }
+        }
     }
 }

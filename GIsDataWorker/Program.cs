@@ -53,9 +53,7 @@ builder.Configuration
     .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true)
     .AddEnvironmentVariables();
 
-builder.Services.AddScoped<IGeoService, GeoService>();
-builder.Services.AddSingleton<IMongoLocationService, MongoLocationService>();
-builder.Services.AddScoped<IOsmReverseService, OsmReverseService>();
+ builder.Services.AddSingleton<IMongoLocationService, MongoLocationService>();
 
 builder.Services.AddWindowsService(o =>
 {
@@ -69,8 +67,10 @@ builder.Services.AddDbContext<ApplicationDbContext>(dbOptions =>
 
 builder.Services.AddSingleton<OsmImportState>();   // ← أضف قبل AddHostedService
 builder.Services.AddHostedService<Worker>();
-builder.Services.AddHostedService<MapUpdateWorker>();
-
+builder.Services.AddHostedService<DataImportBackgroundService>();
+builder.Services.AddScoped<IOsmReverseService, OsmReverseService>();
+// في Program.cs
+ 
 var host = builder.Build();
 
 // ── Auto-migrate on startup ──

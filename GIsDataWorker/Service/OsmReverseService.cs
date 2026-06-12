@@ -1,45 +1,86 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using GIsDataWorker.DTos;
 using GIsDataWorker.Models;
 using Microsoft.EntityFrameworkCore;
 using NetTopologySuite.Geometries;
 
 namespace GIsDataWorker.Services;
 
-// ---------------------------------------------------------------------------
-//  Reverse geocoding over osm2pgsql that matches Nominatim's output.
+// ===========================================================================
+//  OsmReverseService — Nominatim-matching reverse geocoding over osm2pgsql.
 //
-//  Nominatim builds addresses from TWO sources, not just admin boundaries:
+//  KEY DESIGN DECISIONS (matching Nominatim behaviour):
 //
-//    1) boundary=administrative polygons (admin_level 2..12)
-//       → country, state/governorate, county, district
+//  1. RESPONSE COORDINATES ≠ INPUT COORDINATES
+//     Nominatim returns the center of the matched OSM object, not the
+//     coordinates you sent. We do the same: OsmRegion.Latitude/Longitude
+//     are the matched place's canonical coords. The input coords are stored
+//     separately as InputLatitude/InputLongitude for reference.
 //
-//    2) place=* polygons AND nodes (suburb, city, town, village, ...)
-//       → the named places people actually recognise
+//  2. NEAREST PLACE NODE AS PRIMARY RESULT
+//     In Egypt (and many countries), suburbs/neighbourhoods are OSM nodes,
+//     not polygons. Nominatim finds the nearest place=suburb/town/city NODE
+//     and uses it as the primary result (osm_type=node, type=suburb).
 //
-//  Example: Luxor (25.697, 32.637)
-//    - Nominatim returns: "Luxor City, Luxor, Egypt"
-//    - "Luxor City" is a place=suburb POLYGON (not an admin boundary)
-//    - "Luxor" city comes from either a place=city polygon or admin boundary
-//    - "Egypt" is admin_level=2
+//  3. PLACE_RANK
+//     Nominatim assigns a numeric rank (suburb=19, town=18, city=15-16).
+//     Higher rank = smaller area = less coordinate drift = more accurate.
 //
-//  This service now queries both sources, merges them with the same priority
-//  Nominatim uses (place polygons win over admin boundaries for suburb/city
-//  when both exist), and returns the combined result.
-//
-//  No EF.Functions.Transform — all coordinate conversion is done in C# with
-//  the exact EPSG:3857 Web Mercator formula.
+//  4. MULTILINGUAL NAMES
+//     Translated names live in the middle tables (planet_osm_nodes/ways/rels)
+//     as jsonb tags. Fallback: name:{lang} → int_name → name:en → name.
 //
 //  Register: builder.Services.AddScoped<IOsmReverseService, OsmReverseService>();
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 public sealed class OsmReverseService : IOsmReverseService
 {
     private readonly ApplicationDbContext _ctx;
     public OsmReverseService(ApplicationDbContext ctx) => _ctx = ctx;
+
+    private const double EarthRadius = 6_378_137.0;
+
+    // ---- Nominatim place_rank mapping ------------------------------------
+    private static int ToPlaceRank(string? place) => place?.ToLowerInvariant() switch
+    {
+        "neighbourhood" or "quarter" or "city_block" => 22,
+        "suburb" => 19,
+        "town" => 18,
+        "village" => 17,
+        "hamlet" => 20,
+        "city" or "municipality" => 16,
+        "borough" => 18,
+        "county" or "district" or "subdistrict" => 12,
+        "state" or "region" or "province" => 8,
+        "country" => 4,
+        _ => 25,
+    };
+
+    // Specificity for PRIMARY selection (higher = more specific area).
+    private static int PlaceSpecificity(string? place) => place?.ToLowerInvariant() switch
+    {
+        "city_block" or "neighbourhood" or "quarter" => 6,
+        "suburb" => 5,
+        "hamlet" => 4,
+        "village" => 3,
+        "town" or "borough" => 2,
+        "city" or "municipality" => 1,
+        _ => 0,
+    };
+
+    private static readonly HashSet<string> SuburbTypes = new(StringComparer.OrdinalIgnoreCase)
+        { "neighbourhood", "quarter", "city_block", "suburb" };
+    private static readonly HashSet<string> CityTypes = new(StringComparer.OrdinalIgnoreCase)
+        { "city", "town", "village", "hamlet", "municipality", "borough" };
+    private static readonly HashSet<string> CountyTypes = new(StringComparer.OrdinalIgnoreCase)
+        { "county", "district", "subdistrict" };
+    private static readonly HashSet<string> StateTypes = new(StringComparer.OrdinalIgnoreCase)
+        { "state", "region", "province" };
 
     private static readonly string[] NonAttractionTourism =
     {
@@ -47,28 +88,391 @@ public sealed class OsmReverseService : IOsmReverseService
         "chalet", "caravan_site", "camp_site", "information"
     };
 
-    // Place types ordered from most specific to broadest, mirroring
-    // Nominatim's place_rank hierarchy.
-    private static readonly string[] PlaceTypes =
+    // =======================================================================
+    //  1) GetRegionByCoordinatesAsync
+    // =======================================================================
+    public async Task<OsmRegion?> GetRegionByCoordinatesAsync(
+        double lat, double lon, string language = "en", CancellationToken ct = default)
     {
-        "neighbourhood", "quarter", "suburb",          // rank 22–17
-        "village", "hamlet", "town", "city",           // rank 16–13
-        "municipality",                                // rank 12
-        "county", "district", "region", "state",       // rank 12–5
-        "country"                                      // rank 4
+        // ── Coordinate validation ──────────────────────────────────────────
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180)
+            return null;
+
+        // Detect lat/lon swap (lat should be smaller than lon for most of
+        // the Eastern Hemisphere; this catches the common Egypt mistake).
+        if (Math.Abs(lat) > 90)
+            return null;
+
+        var pt = ToMercator(lon, lat);
+        double cosLat = Math.Max(Math.Cos(lat * Math.PI / 180.0), 0.01);
+
+        // ── (1) Nearest place NODES ────────────────────────────────────────
+        double nodeRadiusMerc = 12_000.0 / cosLat;
+
+        var placeNodes = await _ctx.planet_osm_points
+            .Where(p => p.place != null && p.name != null
+                     && p.way.IsWithinDistance(pt, nodeRadiusMerc))
+            .OrderBy(p => p.way.Distance(pt))
+            .Take(60)
+            .Select(p => new { p.place, p.name, p.osm_id, X = p.way.X, Y = p.way.Y })
+            .ToListAsync(ct);
+
+        // ── (2) Place POLYGONS containing the point ────────────────────────
+        var placePolys = await _ctx.planet_osm_polygons
+            .Where(p => p.place != null && p.name != null && p.way.Contains(pt))
+            .Select(p => new { p.place, p.name, p.osm_id, X = p.way.Centroid.X, Y = p.way.Centroid.Y })
+            .ToListAsync(ct);
+
+        // ── (3) Admin boundary POLYGONS containing the point ───────────────
+        var admins = await _ctx.planet_osm_polygons
+            .Where(p => p.boundary == "administrative"
+                     && p.admin_level != null && p.name != null
+                     && p.way.Contains(pt))
+            .Select(p => new { p.admin_level, p.name, p.osm_id, X = p.way.Centroid.X, Y = p.way.Centroid.Y })
+            .ToListAsync(ct);
+
+        if (placeNodes.Count == 0 && placePolys.Count == 0 && admins.Count == 0)
+            return null;
+
+        // ---- Build unified candidate list ---------------------------------
+        var placeCands = new List<PlaceCand>();
+
+        foreach (var n in placeNodes)
+        {
+            var (nLat, nLon) = FromMercator(n.X, n.Y);
+            placeCands.Add(new PlaceCand(
+                n.place!, n.name, n.osm_id ?? 0, Src.Node,
+                HaversineMeters(lat, lon, nLat, nLon), nLat, nLon));
+        }
+        foreach (var p in placePolys)
+        {
+            var (pLat, pLon) = FromMercator(p.X, p.Y);
+            var (src, _) = PolySrc(p.osm_id ?? 0);
+            placeCands.Add(new PlaceCand(
+                p.place!, p.name, p.osm_id ?? 0, src, 0, pLat, pLon));
+        }
+
+        // ---- Pick PRIMARY (most specific, then nearest) -------------------
+        var primary = placeCands
+            .Where(c => PlaceSpecificity(c.Place) > 0)
+            .OrderByDescending(c => PlaceSpecificity(c.Place))
+            .ThenBy(c => c.DistanceM)
+            .FirstOrDefault();
+
+        // ---- Fill hierarchy slots -----------------------------------------
+        var suburb = NearestOfKind(placeCands, SuburbTypes);
+        var city = NearestOfKind(placeCands, CityTypes);
+        var county = NearestOfKind(placeCands, CountyTypes);
+        var state = (PlaceCand?)null;
+        AdminCand? countryCand = null;
+
+        var adminCands = admins
+            .Select(a => new AdminCand(
+                int.TryParse(a.admin_level, out var l) ? l : -1,
+                a.name, a.osm_id ?? 0, a.X, a.Y))
+            .Where(a => a.Level >= 0)
+            .OrderBy(a => a.Level)
+            .ToList();
+
+        foreach (var a in adminCands)
+        {
+            switch (a.Level)
+            {
+                case 2: countryCand ??= a; break;
+                case 3 or 4: state ??= AdminToPlace(a); break;
+                case 5 or 6: county ??= AdminToPlace(a); break;
+                case 7 or 8: city ??= AdminToPlace(a); break;
+                case >= 9: suburb ??= AdminToPlace(a); break;
+            }
+        }
+
+        // Fallback primary
+        primary ??= placeCands.OrderBy(c => c.DistanceM).FirstOrDefault();
+        if (primary is null && adminCands.Count > 0)
+        {
+            var a = adminCands.Last();
+            primary = AdminToPlace(a);
+        }
+        if (primary is null) return null;
+
+        // ---- Resolve multilingual names -----------------------------------
+        var allParts = new List<PlaceCand?> { primary, suburb, city, county, state }
+            .Where(p => p is not null).Select(p => p!).ToList();
+
+        var feats = new List<(long osmId, Src src)>();
+        feats.AddRange(allParts.Select(p =>
+        {
+            // Node ids stay positive; polygon osm_ids: negative=relation, positive=way
+            if (p.Src == Src.Node) return (p.OsmId, Src.Node);
+            var (s, id) = PolySrc(p.OsmId);
+            return (id, s);
+        }));
+        if (countryCand is not null)
+        {
+            var (s, id) = PolySrc(countryCand.OsmId);
+            feats.Add((id, s));
+        }
+
+        var tags = await LoadTagsAsync(feats, ct);
+
+        string? Tr(PlaceCand? p)
+        {
+            if (p is null) return null;
+            if (p.Src == Src.Node)
+                return PickName(LookupTags(tags, p.OsmId, Src.Node), p.Name, language);
+            var (s, id) = PolySrc(p.OsmId);
+            return PickName(LookupTags(tags, id, s), p.Name, language);
+        }
+        string? TrAdmin(AdminCand? a)
+        {
+            if (a is null) return null;
+            var (s, id) = PolySrc(a.OsmId);
+            return PickName(LookupTags(tags, id, s), a.Name, language);
+        }
+
+        // ---- Postcode from primary's tags ---------------------------------
+        string? postcode = null;
+        {
+            Dictionary<string, string>? ptags;
+            if (primary.Src == Src.Node)
+                ptags = LookupTags(tags, primary.OsmId, Src.Node);
+            else
+            {
+                var (s, id) = PolySrc(primary.OsmId);
+                ptags = LookupTags(tags, id, s);
+            }
+            if (ptags is not null)
+                postcode = Get(ptags, "addr:postcode") ?? Get(ptags, "postal_code");
+        }
+
+        // ---- OsmType string (matching Nominatim: "node" / "way" / "relation")
+        string osmType = primary.Src switch
+        {
+            Src.Node => "node",
+            Src.Way => "way",
+            Src.Rel => "relation",
+            _ => "node"
+        };
+
+        return new OsmRegion(
+            Name: Tr(primary),
+            AddressType: primary.Place,
+            PlaceRank: ToPlaceRank(primary.Place),
+            OsmType: osmType,
+            OsmId: primary.Src == Src.Node ? primary.OsmId
+                                : (primary.Src == Src.Rel ? -primary.OsmId : primary.OsmId),
+            AdminLevel: adminCands.FirstOrDefault(a => a.Name == primary.Name)?.Level ?? 0,
+            Place: primary.Place,
+            Country: TrAdmin(countryCand),
+            State: Tr(state),
+            County: Tr(county),
+            City: Tr(city),
+            Suburb: Tr(suburb),
+            Postcode: postcode,
+            // Canonical coordinates of the MATCHED OSM OBJECT (not the input)
+            Latitude: primary.Lat,
+            Longitude: primary.Lon,
+            // Original input for reference / distance calculation
+            InputLatitude: lat,
+            InputLongitude: lon);
+    }
+
+    // =======================================================================
+    //  2) GetNearbyAttractionsAsync  (relevance-ranked)
+    // =======================================================================
+    public async Task<IReadOnlyList<OsmAttraction>> GetNearbyAttractionsAsync(
+        double lat, double lon, int radiusMeters = 2000, int maxResults = 20,
+        string language = "en", CancellationToken ct = default)
+    {
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180)
+            return Array.Empty<OsmAttraction>();
+
+        var pt = ToMercator(lon, lat);
+        double cosLat = Math.Max(Math.Cos(lat * Math.PI / 180.0), 0.01);
+        double radiusMerc = radiusMeters / cosLat;
+
+        var pointHits = await _ctx.planet_osm_points
+            .Where(p => p.name != null
+                     && (p.tourism != null || p.historic != null || p.leisure != null)
+                     && (p.tourism == null || !NonAttractionTourism.Contains(p.tourism))
+                     && p.way.IsWithinDistance(pt, radiusMerc))
+            .Select(p => new RawHit
+            {
+                OsmId = p.osm_id,
+                Name = p.name,
+                Amenity = p.amenity,
+                Tourism = p.tourism,
+                Leisure = p.leisure,
+                Shop = p.shop,
+                HistoricTag = p.historic,
+                IsPolygon = false,
+                X = p.way.X,
+                Y = p.way.Y
+            })
+            .ToListAsync(ct);
+
+        var polygonHits = await _ctx.planet_osm_polygons
+            .Where(p => p.name != null
+                     && (p.tourism != null || p.historic != null || p.leisure != null)
+                     && (p.tourism == null || !NonAttractionTourism.Contains(p.tourism))
+                     && p.way.IsWithinDistance(pt, radiusMerc))
+            .Select(p => new RawHit
+            {
+                OsmId = p.osm_id,
+                Name = p.name,
+                Amenity = p.amenity,
+                Tourism = p.tourism,
+                Leisure = p.leisure,
+                Shop = p.shop,
+                HistoricTag = p.historic,
+                IsPolygon = true,
+                X = p.way.Centroid.X,
+                Y = p.way.Centroid.Y
+            })
+            .ToListAsync(ct);
+
+        var all = pointHits.Concat(polygonHits).ToList();
+        if (all.Count == 0) return Array.Empty<OsmAttraction>();
+
+        // Batch-load translated names
+        var feats = all.Select(h =>
+        {
+            if (!h.IsPolygon) return (h.OsmId ?? 0, Src.Node);
+            var (s, id) = PolySrc(h.OsmId ?? 0); return (id, s);
+        }).ToList();
+        var tags = await LoadTagsAsync(feats, ct);
+
+        return all
+            .Select(h =>
+            {
+                var (hLat, hLon) = FromMercator(h.X, h.Y);
+                int dist = (int)Math.Round(HaversineMeters(lat, lon, hLat, hLon));
+                string? type = h.Tourism ?? h.HistoricTag ?? h.Leisure ?? h.Amenity ?? h.Shop;
+                double score = CategoryWeight(type) / (1.0 + dist / 500.0);
+
+                Src src; long lookupId;
+                if (!h.IsPolygon) { src = Src.Node; lookupId = h.OsmId ?? 0; }
+                else { (src, lookupId) = PolySrc(h.OsmId ?? 0); }
+                string? name = PickName(LookupTags(tags, lookupId, src), h.Name, language);
+
+                return new OsmAttraction(
+                    OsmId: h.OsmId, Name: name,
+                    Amenity: h.Amenity, Tourism: h.Tourism, Leisure: h.Leisure,
+                    Shop: h.Shop, HistoricTag: h.HistoricTag,
+                    Latitude: hLat, Longitude: hLon,
+                    DistanceMeters: dist, Relevance: Math.Round(score, 4));
+            })
+            .Where(a => a.DistanceMeters <= radiusMeters)
+            .OrderByDescending(a => a.Relevance)
+            .ThenBy(a => a.DistanceMeters)
+            .Take(maxResults)
+            .ToList();
+    }
+
+    // -----------------------------------------------------------------------
+    //  Category weights for relevance ranking
+    // -----------------------------------------------------------------------
+    private static double CategoryWeight(string? type) => type?.ToLowerInvariant() switch
+    {
+        "attraction" or "viewpoint" => 1.00,
+        "museum" or "monument" or "castle" or "fort" => 0.95,
+        "archaeological_site" or "ruins" or "theme_park" or "zoo" => 0.90,
+        "aquarium" or "memorial" or "gallery" or "artwork" => 0.80,
+        "nature_reserve" or "beach_resort" => 0.75,
+        "park" or "garden" => 0.65,
+        "place_of_worship" or "mosque" or "church" or "temple" => 0.60,
+        "water_park" or "stadium" => 0.60,
+        _ => 0.45,
     };
 
-    // Which place types map to which address slot.
-    private static readonly HashSet<string> SuburbTypes = new(StringComparer.OrdinalIgnoreCase)
-        { "neighbourhood", "quarter", "suburb" };
-    private static readonly HashSet<string> CityTypes = new(StringComparer.OrdinalIgnoreCase)
-        { "village", "hamlet", "town", "city", "municipality" };
-    private static readonly HashSet<string> CountyTypes = new(StringComparer.OrdinalIgnoreCase)
-        { "county", "district" };
-    private static readonly HashSet<string> StateTypes = new(StringComparer.OrdinalIgnoreCase)
-        { "region", "state" };
+    // -----------------------------------------------------------------------
+    //  Internal helpers
+    // -----------------------------------------------------------------------
+    private static PlaceCand? NearestOfKind(IEnumerable<PlaceCand> c, HashSet<string> k) =>
+        c.Where(x => k.Contains(x.Place)).OrderBy(x => x.DistanceM).FirstOrDefault();
 
-    private const double EarthRadius = 6_378_137.0;
+    private static PlaceCand AdminToPlace(AdminCand a)
+    {
+        var (src, _) = PolySrc(a.OsmId);
+        var (aLat, aLon) = FromMercator(a.X, a.Y);
+        string place = a.Level switch
+        {
+            2 => "country",
+            <= 4 => "state",
+            <= 6 => "county",
+            <= 8 => "city",
+            _ => "suburb"
+        };
+        return new PlaceCand(place, a.Name, a.OsmId, src, 0, aLat, aLon);
+    }
+
+    // ---- Middle-table tag loading (batched) --------------------------------
+    private async Task<Dictionary<string, Dictionary<string, string>>> LoadTagsAsync(
+        IReadOnlyCollection<(long osmId, Src src)> feats, CancellationToken ct)
+    {
+        var map = new Dictionary<string, Dictionary<string, string>>();
+        var nodeIds = feats.Where(f => f.src == Src.Node).Select(f => f.osmId).Distinct().ToList();
+        var wayIds = feats.Where(f => f.src == Src.Way).Select(f => f.osmId).Distinct().ToList();
+        var relIds = feats.Where(f => f.src == Src.Rel).Select(f => f.osmId).Distinct().ToList();
+
+        if (nodeIds.Count > 0)
+            foreach (var x in await _ctx.planet_osm_nodes.Where(n => nodeIds.Contains(n.id))
+                                  .Select(n => new { n.id, n.tags }).ToListAsync(ct))
+                map[$"n{x.id}"] = ParseTags(x.tags);
+
+        if (wayIds.Count > 0)
+            foreach (var x in await _ctx.planet_osm_ways.Where(w => wayIds.Contains(w.id))
+                                  .Select(w => new { w.id, w.tags }).ToListAsync(ct))
+                map[$"w{x.id}"] = ParseTags(x.tags);
+
+        if (relIds.Count > 0)
+            foreach (var x in await _ctx.planet_osm_rels.Where(r => relIds.Contains(r.id))
+                                  .Select(r => new { r.id, r.tags }).ToListAsync(ct))
+                map[$"r{x.id}"] = ParseTags(x.tags);
+
+        return map;
+    }
+
+    private static Dictionary<string, string>? LookupTags(
+        Dictionary<string, Dictionary<string, string>> map, long id, Src src)
+    {
+        string key = src switch { Src.Node => $"n{id}", Src.Way => $"w{id}", _ => $"r{id}" };
+        return map.TryGetValue(key, out var t) ? t : null;
+    }
+
+    private static Dictionary<string, string> ParseTags(string? json)
+    {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(json)) return d;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                foreach (var p in doc.RootElement.EnumerateObject())
+                    if (p.Value.ValueKind == JsonValueKind.String)
+                        d[p.Name] = p.Value.GetString() ?? "";
+        }
+        catch { }
+        return d;
+    }
+
+    private static string? Get(Dictionary<string, string> t, string k) =>
+        t.TryGetValue(k, out var v) && !string.IsNullOrWhiteSpace(v) ? v : null;
+
+    // name:{lang} → int_name → name:en → name → any name:*
+    private static string? PickName(Dictionary<string, string>? tags, string? baseName, string lang)
+    {
+        if (tags is null || tags.Count == 0) return baseName;
+        foreach (var k in new[] { $"name:{lang}", "int_name", "name:en", "name" })
+            if (Get(tags, k) is { } v) return v;
+        var any = tags.Keys.FirstOrDefault(k => k.StartsWith("name:", StringComparison.OrdinalIgnoreCase));
+        if (any is not null && Get(tags, any) is { } a) return a;
+        return baseName;
+    }
+
+    // osm2pgsql polygon osm_id: positive = way, negative = relation
+    private static (Src src, long id) PolySrc(long osmId) =>
+        osmId < 0 ? (Src.Rel, -osmId) : (Src.Way, osmId);
 
     private static Point ToMercator(double lon, double lat)
     {
@@ -84,242 +488,6 @@ public sealed class OsmReverseService : IOsmReverseService
         return (lat, lon);
     }
 
-    // =======================================================================
-    //  1) GetRegionByCoordinatesAsync
-    // =======================================================================
-    public async Task<OsmRegion?> GetRegionByCoordinatesAsync(
-        double lat, double lon, CancellationToken ct = default)
-    {
-        var pointMerc = ToMercator(lon, lat);
-
-        // ── A) Admin boundaries that CONTAIN the point ─────────────────────
-        var adminRows = await _ctx.planet_osm_polygons
-            .Where(p => p.boundary == "administrative"
-                     && p.admin_level != null
-                     && p.name != null
-                     && p.way.Contains(pointMerc))
-            .Select(p => new { p.admin_level, p.name, p.place, p.osm_id })
-            .ToListAsync(ct);
-
-        // ── B) Place polygons that CONTAIN the point ───────────────────────
-        //    (suburb, city, town, village, neighbourhood, etc.)
-        var placePolyRows = await _ctx.planet_osm_polygons
-            .Where(p => p.place != null
-                     && p.name != null
-                     && p.way.Contains(pointMerc))
-            .Select(p => new { p.place, p.name, p.osm_id })
-            .ToListAsync(ct);
-
-        // ── C) Nearest place NODES within ~5 km ────────────────────────────
-        //    Many cities/suburbs exist only as nodes, not polygons.
-        //    Nominatim uses a radius that depends on place type; 5 km is a
-        //    reasonable approximation for city-level reverse geocoding.
-        double nodeRadiusMerc = 5000.0 / Math.Max(Math.Cos(lat * Math.PI / 180.0), 0.01);
-
-        var placeNodeRows = await _ctx.planet_osm_points
-            .Where(p => p.place != null
-                     && p.name != null
-                     && p.way.IsWithinDistance(pointMerc, nodeRadiusMerc))
-            .Select(p => new { p.place, p.name, p.osm_id, X = p.way.X, Y = p.way.Y })
-            .ToListAsync(ct);
-
-        // Nothing at all?
-        if (adminRows.Count == 0 && placePolyRows.Count == 0 && placeNodeRows.Count == 0)
-            return null;
-
-        // ── Merge into a unified address ───────────────────────────────────
-        // Start with slots empty; fill from most-authoritative source.
-        string? country = null, state = null, county = null, city = null, suburb = null;
-        long? primaryOsmId = null;
-        string? primaryName = null;
-        string? primaryPlace = null;
-        int primaryAdminLevel = 0;
-
-        // 1. Admin boundaries → country / state / county (and sometimes city)
-        var admins = adminRows
-            .Select(r => (Level: int.TryParse(r.admin_level, out var l) ? l : (int?)null,
-                          r.name, r.place, r.osm_id))
-            .Where(r => r.Level is not null)
-            .OrderBy(r => r.Level!.Value)
-            .ToList();
-
-        foreach (var a in admins)
-        {
-            int lvl = a.Level!.Value;
-            // Egypt:  2=country, 4=governorate(≈state), 6=district(≈county)
-            // Global: 2=country, 3-4=state, 5-6=county, 7-8=city
-            if (lvl == 2) country = a.name;
-            else if (lvl <= 4) state ??= a.name;
-            else if (lvl <= 6) county ??= a.name;
-            else if (lvl <= 8) city ??= a.name;
-            else suburb ??= a.name;  // 9+ = neighbourhood-level admin
-
-            // Track the most specific admin as a candidate primary
-            if (a.Level!.Value > primaryAdminLevel)
-            {
-                primaryAdminLevel = a.Level.Value;
-                primaryName = a.name;
-                primaryOsmId = a.osm_id;
-                primaryPlace = a.place;
-            }
-        }
-
-        // 2. Place polygons → override suburb / city from named places
-        //    (these are what Nominatim actually prefers for display)
-        var placesFromPolygons = placePolyRows
-            .Where(r => PlaceTypes.Contains(r.place ?? ""))
-            .OrderBy(r => Array.IndexOf(PlaceTypes, r.place))
-            .ToList();
-
-        foreach (var p in placesFromPolygons)
-        {
-            if (SuburbTypes.Contains(p.place!))
-            {
-                suburb ??= p.name;
-                // Suburb is more specific, so it's the primary
-                primaryName = p.name;
-                primaryOsmId = p.osm_id;
-                primaryPlace = p.place;
-                primaryAdminLevel = 0; // not an admin level
-            }
-            else if (CityTypes.Contains(p.place!)) city ??= p.name;
-            else if (CountyTypes.Contains(p.place!)) county ??= p.name;
-            else if (StateTypes.Contains(p.place!)) state ??= p.name;
-        }
-
-        // 3. Place nodes → fill any remaining gaps from nearest nodes
-        //    Prefer nodes that are closer; for each slot, take the first
-        //    match (the list is already ordered by distance via IsWithinDistance).
-        var placesFromNodes = placeNodeRows
-            .Select(n =>
-            {
-                var (nLat, nLon) = FromMercator(n.X, n.Y);
-                return new
-                {
-                    n.place,
-                    n.name,
-                    n.osm_id,
-                    Dist = HaversineMeters(lat, lon, nLat, nLon)
-                };
-            })
-            .Where(n => PlaceTypes.Contains(n.place ?? ""))
-            .OrderBy(n => n.Dist)
-            .ToList();
-
-        foreach (var n in placesFromNodes)
-        {
-            if (SuburbTypes.Contains(n.place!) && suburb == null)
-            {
-                suburb = n.name;
-                primaryName = n.name;
-                primaryOsmId = n.osm_id;
-                primaryPlace = n.place;
-            }
-            else if (CityTypes.Contains(n.place!) && city == null) city = n.name;
-            else if (CountyTypes.Contains(n.place!) && county == null) county = n.name;
-            else if (StateTypes.Contains(n.place!) && state == null) state = n.name;
-        }
-
-        // Build the full areas list for callers that need it
-        var allAreas = admins
-            .Select(a => new AdminArea(a.Level!.Value, a.name, a.place, a.osm_id))
-            .OrderByDescending(a => a.AdminLevel)
-            .ToList();
-
-        // If we have no primary from place polygons, use the most specific admin
-        primaryName ??= allAreas.FirstOrDefault()?.Name;
-        primaryOsmId ??= allAreas.FirstOrDefault()?.OsmId;
-
-        return new OsmRegion(
-            Name: primaryName,
-            AdminLevel: primaryAdminLevel,
-            Place: primaryPlace,
-            OsmId: primaryOsmId,
-            Country: country,
-            State: state,
-            County: county,
-            City: city,
-            Suburb: suburb,
-            Latitude: lat,
-            Longitude: lon,
-            Areas: allAreas);
-    }
-
-    // =======================================================================
-    //  2) GetNearbyAttractionsAsync
-    // =======================================================================
-    public async Task<IReadOnlyList<OsmAttraction>> GetNearbyAttractionsAsync(
-        double lat, double lon, int radiusMeters = 2000, int maxResults = 20,
-        CancellationToken ct = default)
-    {
-        var pointMerc = ToMercator(lon, lat);
-
-        double cosLat = Math.Cos(lat * Math.PI / 180.0);
-        if (cosLat < 0.01) cosLat = 0.01;
-        double radiusMerc = radiusMeters / cosLat;
-
-        // --- POI nodes -------------------------------------------------------
-        var pointHits = await _ctx.planet_osm_points
-            .Where(p => p.name != null
-                     && (p.tourism != null || p.historic != null || p.leisure != null)
-                     && (p.tourism == null || !NonAttractionTourism.Contains(p.tourism))
-                     && p.way.IsWithinDistance(pointMerc, radiusMerc))
-            .Select(p => new RawHit
-            {
-                OsmId = p.osm_id,
-                Name = p.name,
-                Amenity = p.amenity,
-                Tourism = p.tourism,
-                Leisure = p.leisure,
-                Shop = p.shop,
-                HistoricTag = p.historic,
-                X = p.way.X,
-                Y = p.way.Y
-            })
-            .ToListAsync(ct);
-
-        // --- POI areas (use centroid) ----------------------------------------
-        var polygonHits = await _ctx.planet_osm_polygons
-            .Where(p => p.name != null
-                     && (p.tourism != null || p.historic != null || p.leisure != null)
-                     && (p.tourism == null || !NonAttractionTourism.Contains(p.tourism))
-                     && p.way.IsWithinDistance(pointMerc, radiusMerc))
-            .Select(p => new RawHit
-            {
-                OsmId = p.osm_id,
-                Name = p.name,
-                Amenity = p.amenity,
-                Tourism = p.tourism,
-                Leisure = p.leisure,
-                Shop = p.shop,
-                HistoricTag = p.historic,
-                X = p.way.Centroid.X,
-                Y = p.way.Centroid.Y
-            })
-            .ToListAsync(ct);
-
-        return pointHits.Concat(polygonHits)
-            .Select(h =>
-            {
-                var (hLat, hLon) = FromMercator(h.X, h.Y);
-                return new OsmAttraction(
-                    OsmId: h.OsmId,
-                    Name: h.Name,
-                    Amenity: h.Amenity,
-                    Tourism: h.Tourism,
-                    Leisure: h.Leisure,
-                    Shop: h.Shop,
-                    HistoricTag: h.HistoricTag,
-                    Latitude: hLat,
-                    Longitude: hLon,
-                    DistanceMeters: (int)Math.Round(HaversineMeters(lat, lon, hLat, hLon)));
-            })
-            .Where(a => a.DistanceMeters <= radiusMeters)
-            .OrderBy(a => a.DistanceMeters)
-            .Take(maxResults)
-            .ToList();
-    }
-
     private static double HaversineMeters(double lat1, double lon1, double lat2, double lon2)
     {
         const double R = 6_371_000.0;
@@ -331,64 +499,10 @@ public sealed class OsmReverseService : IOsmReverseService
         return 2 * R * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
     }
 
-    private sealed class RawHit
-    {
-        public long? OsmId { get; set; }
-        public string? Name { get; set; }
-        public string? Amenity { get; set; }
-        public string? Tourism { get; set; }
-        public string? Leisure { get; set; }
-        public string? Shop { get; set; }
-        public string? HistoricTag { get; set; }
-        public double X { get; set; }
-        public double Y { get; set; }
-    }
-}
+    private enum Src { Node, Way, Rel }
+    private sealed record PlaceCand(string Place, string? Name, long OsmId, Src Src,
+        double DistanceM, double Lat, double Lon);
+    private sealed record AdminCand(int Level, string? Name, long OsmId, double X, double Y);
 
-// ===========================================================================
-//  DTOs
-// ===========================================================================
-
-public sealed record AdminArea(int AdminLevel, string? Name, string? Place, long? OsmId);
-
-public sealed record OsmAttraction(
-    long? OsmId,
-    string? Name,
-    string? Amenity,
-    string? Tourism,
-    string? Leisure,
-    string? Shop,
-    string? HistoricTag,
-    double Latitude,
-    double Longitude,
-    int DistanceMeters);
-
-/// <summary>
-/// The resolved region for a coordinate. Matches Nominatim's reverse output:
-///   Name       = most specific place covering the point (e.g. "Luxor City")
-///   Place      = OSM place tag of that place (e.g. "suburb")
-///   Suburb     = neighbourhood / quarter / suburb name
-///   City       = city / town / village name
-///   County     = county / district name
-///   State      = state / governorate name
-///   Country    = country name
-/// </summary>
-public sealed record OsmRegion(
-    string? Name,
-    int AdminLevel,
-    string? Place,
-    long? OsmId,
-    string? Country,
-    string? State,
-    string? County,
-    string? City,
-    string? Suburb,
-    double Latitude,
-    double Longitude,
-    IReadOnlyList<AdminArea> Areas)
-{
-    /// <summary>e.g. "Luxor City, Luxor, Luxor, Egypt"</summary>
-    public string DisplayName =>
-        string.Join(", ", new[] { Suburb, City, County, State, Country }
-            .Where(s => !string.IsNullOrEmpty(s)));
+    
 }

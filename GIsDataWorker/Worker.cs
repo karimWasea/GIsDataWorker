@@ -3,6 +3,8 @@ using GIsDataWorker.Models;
 using GIsDataWorker.Service;
 using GIsDataWorker.Services;
 using GIsDataWorker.Utailites;
+using System.Collections.Concurrent;
+using System.Text.Json;
 
 namespace GIsDataWorker
 {
@@ -12,6 +14,15 @@ namespace GIsDataWorker
         private readonly ILogger<Worker> _logger;
         private readonly IMongoLocationService _mongoLocationService;
         private readonly OsmImportState _osmState;
+
+        private static readonly string OutputFolder = @"C:\REstmangoDB";
+        private static readonly string OutputFile = Path.Combine(OutputFolder, "regions.json");
+
+        private static readonly JsonSerializerOptions JsonOpts = new()
+        {
+            WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
 
         public Worker(
             IServiceScopeFactory scopeFactory,
@@ -23,6 +34,8 @@ namespace GIsDataWorker
             _logger = logger;
             _mongoLocationService = mongoLocationService;
             _osmState = osmState;
+
+            Directory.CreateDirectory(OutputFolder);
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -42,9 +55,12 @@ namespace GIsDataWorker
                     var processedCount = 0;
                     var errorCount = 0;
 
+                    // ── collect all regions from this batch ──────────────────
+                    var regionsBag = new ConcurrentBag<object>();
+
                     var parallelOptions = new ParallelOptions
                     {
-                        MaxDegreeOfParallelism = 10,  // tune based on DB performance
+                        MaxDegreeOfParallelism = 10,
                         CancellationToken = stoppingToken
                     };
 
@@ -55,75 +71,72 @@ namespace GIsDataWorker
                         {
                             try
                             {
-                                // Each task gets its own scope + DbContext
-                                // REQUIRED — DbContext is NOT thread-safe
                                 using var scope = _scopeFactory.CreateScope();
                                 var geoService = scope.ServiceProvider
-                                                           .GetRequiredService<IOsmReverseService>();
+                                                      .GetRequiredService<IOsmReverseService>();
 
-                                // ─── 1. Region ──────────────────────────────────────────
+                                // ─── 1. Region ──────────────────────────────
                                 var region = await geoService.GetRegionByCoordinatesAsync(
-                                    location.Latitude, location.Longitude);
+                                    location.Latitude, location.Longitude, language: "en");
 
                                 if (region is not null)
                                 {
                                     _logger.LogInformation(
                                         "[Region] {collection}/{sourceId} ({name}) " +
-                                        "[{lat},{lng}] => {regionName} | " +
-                                        "AdminLevel: {level} | Place: {place} | OsmId: {osmId}",
+                                        "input:[{inLat},{inLng}] matched:[{matchLat},{matchLng}] " +
+                                        "drift:{drift:F0}m => {displayName} | " +
+                                        "type:{addressType} rank:{placeRank} osmType:{osmType} osmId:{osmId}",
                                         location.CollectionName, location.Id, location.Name ?? "N/A",
                                         location.Latitude, location.Longitude,
-                                        region.Name, region.AdminLevel,
-                                        region.Place, region.OsmId);
+                                        region.Latitude, region.Longitude,
+                                        region.DriftMeters, region.DisplayName,
+                                        region.AddressType, region.PlaceRank,
+                                        region.OsmType, region.OsmId);
+
+                                    regionsBag.Add(region);
                                 }
                                 else
                                 {
                                     _logger.LogWarning(
-                                        "[Region] No region found for {collection}/{sourceId} " +
-                                        "({name}) at [{lat},{lng}].",
+                                        "[Region] No region found for {collection}/{sourceId} ({name}) at [{lat},{lng}].",
                                         location.CollectionName, location.Id, location.Name ?? "N/A",
                                         location.Latitude, location.Longitude);
                                 }
 
-                                // ─── 2. Attractions ─────────────────────────────────────
+                                // ─── 2. Attractions ─────────────────────────
                                 var attractions = await geoService.GetNearbyAttractionsAsync(
                                     location.Latitude, location.Longitude,
                                     radiusMeters: 1500,
-                                    maxResults: 100);
+                                    maxResults: 100,
+                                    language: "en");
 
                                 if (attractions.Count > 0)
                                 {
                                     foreach (var attraction in attractions)
                                     {
                                         _logger.LogInformation(
-                                            "[Attraction] {collection}/{sourceId} ({name}) " +
-                                            "[{lat},{lng}] => {attractionName} | " +
-                                            "Type: {type} | Distance: {dist:F0}m",
+                                            "[Attraction] {collection}/{sourceId} ({name}) [{lat},{lng}] => " +
+                                            "{attractionName} | Type: {type} | Distance: {dist:F0}m | Relevance: {rel}",
                                             location.CollectionName, location.Id, location.Name ?? "N/A",
                                             location.Latitude, location.Longitude,
                                             attraction.Name,
                                             attraction.Amenity ?? attraction.Tourism ??
                                             attraction.Leisure ?? attraction.Shop ??
                                             attraction.HistoricTag ?? "unknown",
-                                            attraction.DistanceMeters);
+                                            attraction.DistanceMeters, attraction.Relevance);
                                     }
                                 }
                                 else
                                 {
                                     _logger.LogWarning(
-                                        "[Attraction] None found for {collection}/{sourceId} " +
-                                        "({name}) at [{lat},{lng}].",
+                                        "[Attraction] None found for {collection}/{sourceId} ({name}) at [{lat},{lng}].",
                                         location.CollectionName, location.Id, location.Name ?? "N/A",
                                         location.Latitude, location.Longitude);
                                 }
 
-                                // ─── Thread-safe counter ─────────────────────────────────
                                 Interlocked.Increment(ref processedCount);
                             }
-                            catch (OperationCanceledException)
-                            {
-                                throw; // let Parallel.ForEachAsync stop cleanly
-                            }
+                            catch (OperationCanceledException) { throw; }
                             catch (Exception ex)
                             {
                                 Interlocked.Increment(ref errorCount);
@@ -132,6 +145,11 @@ namespace GIsDataWorker
                                     location.CollectionName, location.Id, location.Name ?? "N/A");
                             }
                         });
+
+                    // ── write all regions to one JSON file ───────────────────
+                    var json = JsonSerializer.Serialize(regionsBag.ToArray(), JsonOpts);
+                    await File.WriteAllTextAsync(OutputFile, json, stoppingToken);
+                    _logger.LogInformation("[JSON] {count} regions written => {path}", regionsBag.Count, OutputFile);
 
                     _logger.LogInformation(
                         "Batch complete — processed: {processed}, errors: {errors}.",
