@@ -55,6 +55,7 @@ builder.Configuration
 
 builder.Services.AddScoped<IGeoService, GeoService>();
 builder.Services.AddSingleton<IMongoLocationService, MongoLocationService>();
+builder.Services.AddScoped<IOsmReverseService, OsmReverseService>();
 
 builder.Services.AddWindowsService(o =>
 {

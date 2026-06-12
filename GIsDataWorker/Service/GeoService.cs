@@ -78,8 +78,7 @@ namespace GIsDataWorker.Services
             {
                 var point = ToWebMercator(latitude, longitude);
 
-                // جلب كل المضلعات المتداخلة مع النقطة
-                var regions = await _db.planet_osm_polygons
+                 var regions = await _db.planet_osm_polygons
                     .AsNoTracking()
                     .Where(p => p.way != null && p.way.Contains(point))
                     .Select(p => new

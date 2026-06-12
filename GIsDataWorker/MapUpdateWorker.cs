@@ -125,8 +125,32 @@ public class MapUpdateWorker : BackgroundService
     // ─────────────────────────────────────────────────────────────────────────
     //  Full import
     // ─────────────────────────────────────────────────────────────────────────
+    private async Task EnsureHstoreExtension()
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            await db.Database.OpenConnectionAsync();
+            var conn = db.Database.GetDbConnection();
+
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS hstore;";
+            await cmd.ExecuteNonQueryAsync();
+
+            _logger.LogInformation("hstore extension ensured.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create hstore extension.");
+            throw;
+        }
+    }
     private async Task RunFullImport()
     {
+        // ✅ تأكد من hstore قبل أي حاجة
+        await EnsureHstoreExtension();
+
         string baseUrl = _mapSettings.BaseUrl;
         if (string.IsNullOrWhiteSpace(baseUrl))
             throw new InvalidOperationException("MapSettings:BaseUrl missing from appsettings.json.");
@@ -145,7 +169,7 @@ public class MapUpdateWorker : BackgroundService
                 throw new Exception($"Download produced an empty or missing file: {tempPath}");
 
             _logger.LogInformation("Starting full osm2pgsql import (--create)...");
-            await ExecuteOsm2PgSql(tempPath, "--create --slim --cache 1000");
+            await ExecuteOsm2PgSql(tempPath, "--create --slim --cache 1000 --hstore-all");
             _logger.LogInformation("Full import completed successfully.");
         }
         finally
@@ -153,6 +177,34 @@ public class MapUpdateWorker : BackgroundService
             if (File.Exists(tempPath)) File.Delete(tempPath);
         }
     }
+    //private async Task RunFullImport()
+    //{
+    //    string baseUrl = _mapSettings.BaseUrl;
+    //    if (string.IsNullOrWhiteSpace(baseUrl))
+    //        throw new InvalidOperationException("MapSettings:BaseUrl missing from appsettings.json.");
+
+    //    string downloadUrl = await GetLatestUrl(baseUrl, @"href=""([^""]+latest\.osm\.pbf)""");
+    //    if (string.IsNullOrEmpty(downloadUrl))
+    //        throw new Exception("Could not find full map download URL.");
+
+    //    string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".pbf");
+    //    try
+    //    {
+    //        await DownloadFile(downloadUrl, tempPath);
+
+    //        var fi = new FileInfo(tempPath);
+    //        if (!fi.Exists || fi.Length == 0)
+    //            throw new Exception($"Download produced an empty or missing file: {tempPath}");
+
+    //        _logger.LogInformation("Starting full osm2pgsql import (--create)...");
+    //        await ExecuteOsm2PgSql(tempPath, "--create --slim --cache 1000");
+    //        _logger.LogInformation("Full import completed successfully.");
+    //    }
+    //    finally
+    //    {
+    //        if (File.Exists(tempPath)) File.Delete(tempPath);
+    //    }
+    //}
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Diff update

@@ -70,7 +70,7 @@ option to `ON`) but make sure you are using a compatible version:
 * [protozero](https://github.com/mapbox/protozero) (>= 1.6.3)
 
 It also requires access to a database server running
-[PostgreSQL](https://www.postgresql.org/) (version 11+ works, 13+ strongly
+[PostgreSQL](https://www.postgresql.org/) (version 12+ works, 14+ strongly
 recommended) and [PostGIS](https://www.postgis.net/) (version 3.0+).
 
 Make sure you have installed the development packages for the libraries
@@ -223,8 +223,9 @@ GNU General Public License for more details.
 
 ## Maintainers
 
-The current maintainers of osm2pgsql are [Sarah Hoffmann](https://github.com/lonvia/)
-and [Paul Norman](https://github.com/pnorman/).
+The current maintainers of osm2pgsql are [Sarah Hoffmann](https://github.com/lonvia/),
+[Paul Norman](https://github.com/pnorman/) and
+[Jochen Topf](https://github.com/joto).
 
 ## Contributing
 

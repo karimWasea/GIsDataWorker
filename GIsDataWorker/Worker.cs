@@ -59,7 +59,7 @@ namespace GIsDataWorker
                                 // REQUIRED — DbContext is NOT thread-safe
                                 using var scope = _scopeFactory.CreateScope();
                                 var geoService = scope.ServiceProvider
-                                                           .GetRequiredService<IGeoService>();
+                                                           .GetRequiredService<IOsmReverseService>();
 
                                 // ─── 1. Region ──────────────────────────────────────────
                                 var region = await geoService.GetRegionByCoordinatesAsync(
